@@ -57,11 +57,18 @@ attempt directory has following files:
 
     structure:
       files/<path>            - first written version of each file (original)
-      files/<pid>/<path>      - overwrite by process <pid> (only if file already existed in files/)
+      files-<pid>/<path>      - overwrite by process <pid> (only if file already existed in files/)
+    note: files-<pid>/ not files/<pid>/ - otherwise can't distinguish /123/foo (normal path) from pid folder.
+
+    process pids are deterministic, allocated by uwrx (not actual OS pids):
+      - supervisor is pid 1
+      - spawned processes get 2, 3, 4, ... in spawn order
+      - mapping to actual OS pids kept in supervisor
+      - on replay, processes get matching pids from trace (handles racy scheduling)
 
     when a process writes a file:
       - if file doesn't exist in files/: write to files/<path>
-      - if file already exists in files/: write to files/<pid>/<path>
+      - if file already exists in files/: write to files-<pid>/<path>
 
     this keeps most files directly in files/, per-pid directories only for conflicts.
     files can be deduplicated via hardlinks or reflinks when content is identical.
@@ -69,14 +76,14 @@ attempt directory has following files:
     if files were deleted, a 0/0 char device whiteout is created, same as used in overlayfs.
 
     during process P execution, file reads resolve as follows:
-      1. find all files/<pid>/<path> where pid < P (versions written before P ran)
+      1. find all files-<pid>/<path> where pid < P (versions written before P ran)
       2. use the one with largest such pid
       3. if none exist, use files/<path> (the original first version)
       4. if not in files/ at all, check parent traces' files/ directories
       5. finally, real filesystem
 
     no need to record pid for files in base files/ - pid ordering determines visibility:
-    if P's pid is smaller than all files/<pid>/ containing the file, P sees the original.
+    if P's pid is smaller than all files-<pid>/ containing the file, P sees the original.
 
   files.meta - tracks file operations for inspection and debugging
     tab-separated entries, appended as operations occur:

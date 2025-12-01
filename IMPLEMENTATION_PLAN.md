@@ -134,7 +134,12 @@ uwrx/
 
 #### 2.3 Process Lifecycle (`src/supervisor/lifecycle.zig`)
 - **Tasks**:
-  - Track all supervised processes (pid -> process info map)
+  - Allocate deterministic pids (not OS pids):
+    - Supervisor is pid 1
+    - Spawned processes get 2, 3, 4, ... in spawn order
+    - Maintain mapping: uwrx_pid <-> actual_os_pid
+    - On replay, processes get matching pids from trace (handles racy scheduling)
+  - Track all supervised processes (uwrx_pid -> process info map)
   - Handle process creation notifications from manager threads
   - Handle process termination (collect final traces, clean up)
   - Implement graceful shutdown (SIGTERM to all children)
@@ -339,12 +344,13 @@ uwrx/
 - **Tasks**:
   - Build layered view from parent traces and per-process versions
   - For process P reading file X, resolution order:
-    1. Find all `files/<pid>/X` where `pid < P` (versions written before P ran)
+    1. Find all `files-<pid>/X` where `pid < P` (versions written before P ran)
     2. Use the one with largest such pid
     3. If none exist, use `files/X` (the original first version)
     4. If not in `files/` at all, check parent traces' `files/` directories
     5. Finally, real filesystem (read-only base)
-  - Pid ordering determines visibility - no separate tracking needed
+  - Note: `files-<pid>/` not `files/<pid>/` to distinguish from normal paths like `/123/foo`
+  - Pids are deterministic (allocated by uwrx), not actual OS pids
   - Handle whiteouts (deleted files) - same resolution logic applies
 
 #### 6.2 Path Remapping (`src/filesystem/remap.zig`)
@@ -379,13 +385,14 @@ uwrx/
   - Problem: if A writes foo, B reads foo, C overwrites foo - need B's input version to determine if B can be skipped
   - Directory structure:
     - `files/<path>` - first written version (original)
-    - `files/<pid>/<path>` - overwrites by process pid (only when file already existed)
+    - `files-<pid>/<path>` - overwrites by process pid (only when file already existed)
+  - Note: `files-<pid>/` not `files/<pid>/` to distinguish from normal paths
   - On file write:
     - If file doesn't exist in `files/`: write to `files/<path>`
-    - If file already exists in `files/`: write to `files/<pid>/<path>`
+    - If file already exists in `files/`: write to `files-<pid>/<path>`
   - Deduplication: use hardlinks or reflinks when file content is identical
-  - No need to track pid for base `files/` - pid ordering determines visibility:
-    - If process P's pid < all `files/<pid>/` containing the file, P sees original
+  - Pids are deterministic (allocated by uwrx: 1=supervisor, 2, 3, 4... for spawned processes)
+  - No need to track pid for base `files/` - pid ordering determines visibility
   - Maintain `files.meta` for inspection (not for resolution):
     - `<relative_path>\t<pid>\t<operation>\t<exec_path>`
   - Operations tracked: `create`, `write`, `delete`, `rename_to`, `rename_from`, `mkdir`, `rmdir`, `chmod`, `chown`
@@ -442,14 +449,15 @@ uwrx/
   - On current run, before executing whitelisted process P:
     - For each file X that P read in replay trace:
       - Resolve which version P would see now using pid ordering:
-        - Find `files/<pid>/X` with largest `pid < P`, or `files/X` if none
+        - Find `files-<pid>/X` with largest `pid < P`, or `files/X` if none
       - Compare content with what P saw in replay trace
     - If all input versions match: cache hit, can skip
     - If any input differs: must re-execute
-  - Per-process versioning via pid directories is essential:
+  - Per-process versioning via `files-<pid>/` directories is essential:
     - Example: A writes foo, B reads foo, C overwrites foo
-    - B sees `files/foo` (original), C's version goes to `files/<C_pid>/foo`
+    - B sees `files/foo` (original), C's version goes to `files-<C_pid>/foo`
     - On replay, can verify B's input by checking `files/foo`
+  - Deterministic pids ensure same logical process gets same pid on replay
 
 #### 8.3 Process Skipping (`src/rebuild/skip.zig`)
 - **Tasks**:
