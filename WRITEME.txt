@@ -50,20 +50,44 @@ attempt directory has following files:
     custom timestamp_clock_id with is_incremental an TrackEventDefaults аre used to reduce trace size.
   ca.pem - mitm proxy CA certificate
   seed.txt - PRNG seed, in hex
-  files/ - this is a directory with files that were modified by processes during this run of uwrx
-    if files were deleted, a 0/0 char device whiteout is created, same as used in the overlayfs
-    this way an overlayfs view of current state of this attempt can be constructed.
-  files.meta - tracks which process last modified each file in files/
-    this is a text file with one entry per line, tab-separated:
-      <relative_path>\t<pid>\t<operation>\t<exec_path>
+  files/ - directory structure tracking file modifications per-process
+    this is essential for partial rebuild: when determining if a process can be skipped, we need to know
+    exactly which version of each file it read. if process A writes foo.txt, process B reads it, then
+    process C overwrites foo.txt - we need B's input version preserved to correctly determine if B can be skipped.
+
+    structure:
+      files/common/           - files that have a single final writer (optimization)
+      files/<pid>/            - files written by this pid that were later overwritten by another process
+
+    when a process writes a file:
+      - if file doesn't exist or was last written by same pid: write to files/common/
+      - if file exists and was written by different pid: move existing to files/<prev_pid>/, write new to files/common/
+
+    this way most files stay in common/, per-process copies only created on conflict.
+    files can be deduplicated via hardlinks or reflinks when content is identical.
+
+    if files were deleted, a 0/0 char device whiteout is created, same as used in overlayfs.
+    whiteouts also go to files/<pid>/ if deletion conflicts with another process's version.
+
+    during process execution, file reads see (in order, first match wins):
+      1. files/common/ (if written by this process or a predecessor in execution order)
+      2. files/<predecessor_pid>/ for the latest version written before this process ran
+      3. parent traces' files/ directories
+      4. real filesystem
+
+  files.meta - tracks file versions and which process wrote each
+    tab-separated entries, appended as operations occur:
+      <relative_path>\t<pid>\t<operation>\t<exec_path>\t<location>
     where:
-      relative_path - path relative to the files/ directory
+      relative_path - path relative to files/ (without common/ or pid/ prefix)
       pid - process id that performed the modification
       operation - one of: create, write, delete, rename_to, rename_from, mkdir, rmdir, chmod, chown
-      exec_path - the executable path of the process (from execve)
-    entries are appended as modifications occur, so later entries override earlier ones for the same path.
-    on replay, this file is regenerated from the new run's activity.
-    this allows inspection tools to answer "which process created/modified this file?"
+      exec_path - the executable path of the process
+      location - "common" or the pid whose directory contains this version
+    this enables:
+      - reconstructing which version each process saw
+      - determining if a process can be skipped (all its read inputs unchanged)
+      - inspection tools answering "which process created/modified this file?"
   net/<domain_name>/<path>/ ... /<path>/<file> - a file saved by proxy
   net/<domain_name>/<path>/ ... /<path>/<repo>.git/ - a bare mirror repository saved by proxy 
   net/<domain_name>/cert.pem - if there was https connection to this domain, this is the mitm certificate generated for it
