@@ -338,14 +338,14 @@ uwrx/
 #### 6.1 Overlay Filesystem (`src/filesystem/overlay.zig`)
 - **Tasks**:
   - Build layered view from parent traces and per-process versions
-  - Layers for a given process P (checked top-down, first match wins):
-    - Current attempt `files/common/` (if written by P or predecessor in execution order)
-    - Current attempt `files/<predecessor_pid>/` (latest version before P ran)
-    - Parent trace `files/` directories (in dependency order)
-    - Real filesystem (read-only base)
-  - Path resolution requires knowing current process and execution order
-  - Coordinate with `meta.zig` for version tracking
-  - Handle whiteouts (deleted files) - also versioned per-process
+  - For process P reading file X, resolution order:
+    1. Find all `files/<pid>/X` where `pid < P` (versions written before P ran)
+    2. Use the one with largest such pid
+    3. If none exist, use `files/X` (the original first version)
+    4. If not in `files/` at all, check parent traces' `files/` directories
+    5. Finally, real filesystem (read-only base)
+  - Pid ordering determines visibility - no separate tracking needed
+  - Handle whiteouts (deleted files) - same resolution logic applies
 
 #### 6.2 Path Remapping (`src/filesystem/remap.zig`)
 - **Tasks**:
@@ -378,24 +378,19 @@ uwrx/
   - Track per-process file versions for correct partial rebuild
   - Problem: if A writes foo, B reads foo, C overwrites foo - need B's input version to determine if B can be skipped
   - Directory structure:
-    - `files/common/` - files with single final writer (optimization, most files live here)
-    - `files/<pid>/` - files written by pid that were later overwritten by another process
+    - `files/<path>` - first written version (original)
+    - `files/<pid>/<path>` - overwrites by process pid (only when file already existed)
   - On file write:
-    - If file doesn't exist or was last written by same pid: write to `files/common/`
-    - If file exists and was written by different pid: move existing to `files/<prev_pid>/`, write new to `files/common/`
+    - If file doesn't exist in `files/`: write to `files/<path>`
+    - If file already exists in `files/`: write to `files/<pid>/<path>`
   - Deduplication: use hardlinks or reflinks when file content is identical
-  - Maintain `files.meta` with entries:
-    - `<relative_path>\t<pid>\t<operation>\t<exec_path>\t<location>`
-    - location is "common" or the pid whose directory contains this version
+  - No need to track pid for base `files/` - pid ordering determines visibility:
+    - If process P's pid < all `files/<pid>/` containing the file, P sees original
+  - Maintain `files.meta` for inspection (not for resolution):
+    - `<relative_path>\t<pid>\t<operation>\t<exec_path>`
   - Operations tracked: `create`, `write`, `delete`, `rename_to`, `rename_from`, `mkdir`, `rmdir`, `chmod`, `chown`
-  - Provide query interfaces:
-    - `getFileVersion(path, as_of_pid) -> ?VersionInfo` - what version would this pid see?
-    - `getFileHistory(path) -> []VersionInfo` - all versions of a file
-  - During process execution, file reads resolve to (first match wins):
-    1. `files/common/` if written by this process or predecessor
-    2. `files/<predecessor_pid>/` for latest version before this process
-    3. Parent traces' `files/` directories
-    4. Real filesystem
+  - Provide query interface:
+    - `resolveFile(path, as_of_pid) -> ?FilePath` - which actual file would this pid see?
   - Essential for partial rebuild cache hit detection
 
 ---
@@ -442,18 +437,19 @@ uwrx/
 #### 8.2 Cache Hit Detection (`src/rebuild/cache.zig`)
 - **Tasks**:
   - For each process in replay trace:
-    - Collect all read file paths and the specific versions read (from `files.meta`)
+    - Collect all read file paths
     - Collect all written file paths
   - On current run, before executing whitelisted process P:
-    - For each file P read in the replay trace:
-      - Determine which version P would see now (using `meta.getFileVersion(path, P)`)
-      - Compare with version P saw in replay trace
+    - For each file X that P read in replay trace:
+      - Resolve which version P would see now using pid ordering:
+        - Find `files/<pid>/X` with largest `pid < P`, or `files/X` if none
+      - Compare content with what P saw in replay trace
     - If all input versions match: cache hit, can skip
     - If any input differs: must re-execute
-  - Per-process versioning in `files/` is essential for this:
-    - Without it, can't determine what version each process saw
+  - Per-process versioning via pid directories is essential:
     - Example: A writes foo, B reads foo, C overwrites foo
-    - Need `files/<A_pid>/foo` to verify B's input hasn't changed
+    - B sees `files/foo` (original), C's version goes to `files/<C_pid>/foo`
+    - On replay, can verify B's input by checking `files/foo`
 
 #### 8.3 Process Skipping (`src/rebuild/skip.zig`)
 - **Tasks**:
