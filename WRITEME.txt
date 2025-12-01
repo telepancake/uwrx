@@ -53,6 +53,17 @@ attempt directory has following files:
   files/ - this is a directory with files that were modified by processes during this run of uwrx
     if files were deleted, a 0/0 char device whiteout is created, same as used in the overlayfs
     this way an overlayfs view of current state of this attempt can be constructed.
+  files.meta - tracks which process last modified each file in files/
+    this is a text file with one entry per line, tab-separated:
+      <relative_path>\t<pid>\t<operation>\t<exec_path>
+    where:
+      relative_path - path relative to the files/ directory
+      pid - process id that performed the modification
+      operation - one of: create, write, delete, rename_to, rename_from, mkdir, rmdir, chmod, chown
+      exec_path - the executable path of the process (from execve)
+    entries are appended as modifications occur, so later entries override earlier ones for the same path.
+    on replay, this file is regenerated from the new run's activity.
+    this allows inspection tools to answer "which process created/modified this file?"
   net/<domain_name>/<path>/ ... /<path>/<file> - a file saved by proxy
   net/<domain_name>/<path>/ ... /<path>/<repo>.git/ - a bare mirror repository saved by proxy 
   net/<domain_name>/cert.pem - if there was https connection to this domain, this is the mitm certificate generated for it

@@ -46,7 +46,8 @@ uwrx/
 │   │   ├── overlay.zig          # Layered filesystem view
 │   │   ├── remap.zig            # Path remapping
 │   │   ├── whiteout.zig         # Whiteout (deletion) handling
-│   │   └── timestamp.zig        # Timestamp/permission squashing
+│   │   ├── timestamp.zig        # Timestamp/permission squashing
+│   │   └── meta.zig             # File modification metadata tracking
 │   ├── reproducibility/
 │   │   ├── mod.zig              # Reproducibility module root
 │   │   ├── prng.zig             # Hierarchical PRNG system
@@ -270,6 +271,7 @@ uwrx/
     - `perfetto` - Compressed trace
     - `ca.pem` - CA certificate
     - `seed.txt` - PRNG seed (hex)
+    - `files.meta` - File modification metadata (process tracking)
   - Manage `files/` directory with whiteouts
   - Manage `net/` directory structure
   - Handle `parent/` symlinks
@@ -369,6 +371,21 @@ uwrx/
   - Replace actual timestamps with layer timestamps
   - Normalize permissions as needed
 
+#### 6.5 File Modification Metadata (`src/filesystem/meta.zig`)
+- **Tasks**:
+  - Track which process last modified each file in `files/`
+  - Maintain `files.meta` file in attempt directory with entries:
+    - `<relative_path>\t<pid>\t<operation>\t<exec_path>`
+  - Operations tracked: `create`, `write`, `delete`, `rename_to`, `rename_from`, `mkdir`, `rmdir`, `chmod`, `chown`
+  - Append entries as modifications occur (later entries override earlier for same path)
+  - On file write operations in overlay:
+    - Record pid performing the operation
+    - Record operation type
+    - Record executable path of the process (from execve tracking)
+  - Provide query interface: `getFileModifier(path) -> ?ProcessInfo`
+  - Regenerate on replay (don't carry over from replayed trace)
+  - Used by inspection tools to answer "which process created/modified this file?"
+
 ---
 
 ### Phase 7: Reproducibility
@@ -436,6 +453,8 @@ uwrx/
 - **Tasks**:
   - Commands:
     - `uwrx inspect files <trace>` - List read/modified files
+    - `uwrx inspect files <trace> --who` - Show which process modified each file (uses files.meta)
+    - `uwrx inspect files <trace> --by-pid <pid>` - List files modified by specific process
     - `uwrx inspect procs <trace>` - List/tree processes
     - `uwrx inspect output <trace> [pid]` - Show stdout/stderr
     - `uwrx inspect events <trace>` - Raw event listing
