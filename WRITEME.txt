@@ -1,1 +1,131 @@
+UWRX - A tool for running something
 
+OVERVIEW
+
+urwx runs as a supervisor of a process tree.
+Supervisor
+  registers as subreaper,
+  initializes tmpfs directory where it will monitor, read and drain trace files,
+  runs dns and proxy server logic,
+  cleans up when subprocess finishes or when it is terminated.
+It then launches the process that was given on command line after "--" in the
+environment specified by the options.
+During operation it collects and displays/saves traces from subprocesses.
+Supervisor is responsible for updating read-write layers that have been modified. 
+
+SUPERVISION
+
+urwx intercepts most syscalls of the running subprocesses. It is done in-process, using separate manager thread
+that itself does not have seccomp (and so can execute syscalls as well as start new subprocesses without seccomp).
+Processes are launched under supervision as follows:
+  uwrx loads, loads a copy of itself into upper available addresses and jumps there.
+  this will be the managing thread that will communicate with supervisor uwrx and handle syscalls.
+  it sets up the reduced free address space to launch ld.so obtained from PT_INTERP program header of the target executable.
+  it loads and relocates the appropriate ld.so, sets up argv/env/auxv/tls/vdso and starts a new thread
+  the new thread sets up seccomp unotify with _USER_INTERP to send syscall notifies to the manager thread
+  manager thread optionally logs and uses _FLAG_CONTINUE to simply let  the syscalls proceed
+  notable exceptions are
+    starting new process. uwrx intercepts this to launch the subprocess so that it also has uwrx manager thread.
+      this is also where skipping a process during partial rebuild happens.
+    network operations. supervisor process is used to open all network sockets.
+    file operations. intercepted to implement the layered, remapped filesystem view, as well as to suqash time and permissions
+Manager thread communicates with the supervisor using "normal" IPC for things that require immediate handling,
+as well as using low overhead high latency tracing buffers.
+
+TRACING
+
+uwrx writes (and optionally reads, on a replay) a trace. Trace contains information about processes,
+what file and network operations they did, their arguments, what was written to stdout/stderr,
+global parameters of the run and so on.
+
+traces are kept in directories.
+trace directories are organized under a "build" directory as build/<step>/<attempt>, with each step being a different
+command, and each attempt being either a fresh rerun or a replay of another attempt.
+step directory also contains:
+  cmd - the command that was executed
+  options - the urwx argument values (including the default/selected values for arguments that were omitted)
+
+attempt directory has following files:
+  perfetto - the trace events in perfetto format. COMPRESSION_TYPE_DEFLATE,
+    custom timestamp_clock_id with is_incremental an TrackEventDefaults аre used to reduce trace size.
+  ca.pem - mitm proxy CA certificate
+  seed.txt - PRNG seed, in hex
+  files/ - this is a directory with files that were modified by processes during this run of uwrx
+    if files were deleted, a 0/0 char device whiteout is created, same as used in the overlayfs
+    this way an overlayfs view of current state of this attempt can be constructed.
+  net/<domain_name>/<path>/ ... /<path>/<file> - a file saved by proxy
+  net/<domain_name>/<path>/ ... /<path>/<repo>.git/ - a bare mirror repository saved by proxy 
+  net/<domain_name>/cert.pem - if there was https connection to this domain, this is the mitm certificate generated for it
+  net/<domain_name>/ip4.txt - selected IPv4 loopback address for this domain
+  net/<domain_name>/ip6.txt - selected IPv6 loopback address for this domain
+  parent/<number> - a symlink to a parent trace. if there is more that one parent trace, they are stacked in increasing order.
+    parent traces conceptually are commands that have been executed before the command in this trace in an unspecified order.
+    all parents are collected recursively, then ordered in dependency order. having conflicting order (i.e. a loop) is an error.
+    similarly, having two parent traces modify the same path if they are not ordered among themselves is an error (but since it
+    is expensive to enforce, special command can be used to check for this)
+    all "files/" directories of parents form layers of read only base directories, similar to overlayfs.
+  replay - a symlink to a trace that is being replied. during reply events are still recorded, to debug inconsistencies, failures
+    and to see impact of cached network requests and partial rebuild speedups.
+    replay can have different set of parent traces (as a part of, say, edit/rebuild cycle)
+
+Each monitor thread opens a file in a tmpfs directory created by the supervisor using it's pid as a filename.
+Events to the file are written in perfetto trace format. To avoid syscall overhead per write, the file is mmaped in
+a 1MB window using MAP_POPULATE, that advances forward by 1MB-MAX_EVENT_SIZE (rounded down to whole pages)
+wherever writing offset is less that MAX_EVENT_SIZE from the end of the buffer after the write.
+Supervisor periodically reads the directory to find new trace buffers, and uses kill() to check if process that created the buffer
+still exists. if process does not exist, the file is read and processed completely and then deleted.
+Otherwise, at least 1MB from the end of file (as can be determined by e.g. SEEK_HOLE) is left unprocessed, to avoid reading
+partially written data.
+Events are processed (filtered, printed if needed) and merged into one perfetto trace that is compressed and saved onto disk.
+To avoid excessive tmpfs use, supervisor discards already read data by using fallocate with FALLOC_FL_PUNCH_HOLE and FALLOC_FL_KEEP_SIZE
+to discard completely read pages from the start of the file.
+
+ISOLATION
+
+Subprocesses do not access network directly.
+When subprocess does dns lookup, supervisor records the lookup result, and, if it is successful, allocates new random loopback
+IP address for each new domain. This allows tracking which TCP connection connects to which domain without looking at SNI,
+as well as prevents connections to hardcoded IP addresses (except if whitelisted).
+uwrx implements mitm proxy. it creates CA cert on startup that is recorded in the trace and placed in an overlay, in locations usually
+used to store CA certificates.
+when there is TLS connection, uwrx creates certificate for the domain name recorded by the DNS for the loopback address of this connection.
+contents of the tls connection (all requests and responses) are recorded in the trace in plain text.
+
+To simplify operation, requests that look like file downloads have the response body saved in the trace as a plain file,
+under domain/path/filename path. Similarly, if connection used git:// protocol or looks like connection to a git server using
+http(s), then a bare mirror repository is saved under domain/path/repo.git/ and then process is served the repo from that
+mirror.
+
+REPRODUCIBILITY
+
+uwrx tries to make subprocess runs reproducible in many ways.
+  Random is generated using hierarchy of PRNGs that has seed chosen and saved in the trace. This covers AT_RANDOM, /dev/urandom etc.
+    on trace replay, random values are the same.
+  Timestamps are the same for each filesystem layer. Lower layers are older, higher layers are newer. This has no relation to actual
+    file timestamps on disk.
+  Network connections are intercepted and replayed from the recorded, intercepted information.
+  Time returns the same value.
+
+NETWORK CAPTURE AND REPLAY
+
+In capture mode, uwrx records events and caches network access that cannot be served from any parent trace.
+In reply mode, there is no network access, everything is served only from the traces.
+If trace has parent traces, they are always used for reply.
+However, when there is a reply trace, new external requests can be disabled by an option.
+
+PARTIAL REBUILD
+
+When recording trace with parent traces, some processes can be skipped altogether, instead simply producing
+their stdout/stderr output and exit status right from the monitoring thread of the parent.
+Which processes can be skipped this way depends on the whitelist. By default it includes common compiler commands
+such as cc, gcc and so on.
+Process is skipped, if files and directories that it (and all it's subprocesses) accessed for reading have not changed.
+There can be changes if replay has different set of parents that the command it is replaying.
+ 
+INSPECTION
+
+along with ability to use perfetto ui to inspect the trace, uwrx also has commands for inspecting the trace.
+this allows seeing lists of files that were read/modified, lists and trees of processes,
+summary stdout/stderr as well as per process output and so on.
+There is also an interactive terminal UI that presents hierarchy of all launched processes, and allows
+navigating and examinig each process and it's related entries.
