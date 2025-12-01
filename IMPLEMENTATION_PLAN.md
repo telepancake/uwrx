@@ -61,14 +61,14 @@ uwrx/
 │   │   ├── mod.zig              # Inspection module root
 │   │   ├── cli.zig              # CLI inspection commands
 │   │   └── tui.zig              # Interactive terminal UI
+│   ├── tests/
+│   │   ├── unit/                # Unit tests
+│   │   └── integration/         # Integration tests
 │   └── util/
 │       ├── mod.zig              # Utilities module root
 │       ├── linux.zig            # Linux-specific syscall wrappers
 │       ├── deflate.zig          # DEFLATE compression
 │       └── allocator.zig        # Custom allocators
-├── tests/
-│   ├── unit/                    # Unit tests
-│   └── integration/             # Integration tests
 └── docs/
     └── ...                      # Documentation
 ```
@@ -82,9 +82,9 @@ uwrx/
 #### 1.1 Build System Setup
 - **File**: `build.zig`, `build.zig.zon`
 - **Tasks**:
-  - Configure Zig build with target platforms (Linux x86_64 primary)
-  - Set up test configuration
-  - Configure release/debug modes
+  - Configure Zig build with target platforms (Linux x86_64 and aarch64 primary)
+  - Set up test configuration. tests are part of main statically linked urwx executable
+  - Configure release/debug modes.
   - Add dependencies (if any external Zig packages needed)
 
 #### 1.2 Linux Syscall Interface (`src/util/linux.zig`)
@@ -96,20 +96,21 @@ uwrx/
     - `clone3()` for process spawning with control
     - `pidfd_open()`, `pidfd_getfd()`
     - `memfd_create()` for anonymous memory
-    - `fallocate()` with `FALLOC_FL_PUNCH_HOLE`
-    - `mount()` for tmpfs
+    - `fallocate()` with `FALLOC_FL_PUNCH_HOLE` and `FALLOC_FL_KEEP_SIZE`
   - Define all necessary structs: `seccomp_notif`, `seccomp_notif_resp`, etc.
 
 #### 1.3 CLI and Entry Point (`src/main.zig`)
 - **Tasks**:
   - Parse command-line arguments:
-    - `--trace-dir <path>` - Build directory location
-    - `--step <name>` - Step name
-    - `--parent <path>` - Parent trace(s)
-    - `--replay <path>` - Trace to replay
-    - `--capture` / `--replay-only` - Network mode
-    - `-- <command> [args...]` - Command to supervise
-  - Commands: `run`, `inspect`, `replay`, `check`
+    -"uwrx run [options] -- <command> [args...]"  - Supervise a command
+      - `--build <path>` - Build directory location, default is ./build
+      - `--step <name>` - Step name, default is the largest step + 10, or 0 if none exist yet (cannot be specified for replay)
+      - `--parent <path>` - Parent trace(s)
+      - `--replay <path>` - Trace to replay
+      - `--net` / `--no-net` - Network mode. For replay default is off, otherwise default is on
+      - `--tmp <path>` - Location where create temporary file directory, default under /tmp
+    - "test <test> [options]" - run a test case
+    - "ui <path>" - examine a trace interactively
   - Initialize logging
   - Dispatch to appropriate module
 
@@ -122,12 +123,12 @@ uwrx/
   - Call `prctl(PR_SET_CHILD_SUBREAPER, 1)` to become subreaper
   - Set up `SIGCHLD` handler for child process reaping
   - Maintain process tree state
+  - check if all subprocesses have ended (some might have detached by double fork) before finishing active phase
 
 #### 2.2 tmpfs Management (`src/supervisor/tmpfs.zig`)
 - **Tasks**:
-  - Create private mount namespace
-  - Mount tmpfs at designated location for trace buffers
-  - Create directory structure: `<tmpfs>/traces/`
+  - Create unique temporary directory under /tmp or another location specified by "--tmp" option
+  - Create directory structure: `<tmpdir>/traces/`
   - Implement cleanup on termination
 
 #### 2.3 Process Lifecycle (`src/supervisor/lifecycle.zig`)
@@ -144,8 +145,8 @@ uwrx/
     - Check if owning process still exists (`kill(pid, 0)`)
     - Read up to (file_size - 1MB) to avoid partial writes
     - Parse Perfetto events
-    - Use `fallocate(FALLOC_FL_PUNCH_HOLE)` to reclaim space
-  - For terminated processes: read entire file, delete
+    - Use `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` to reclaim space
+  - For terminated processes: finish reading entire file, delete
   - Feed events to merger
 
 ---
@@ -156,7 +157,7 @@ uwrx/
 - **Tasks**:
   - Parse ELF headers (Ehdr, Phdr)
   - Extract PT_INTERP to find dynamic linker path
-  - Load ELF segments with correct permissions
+  - Load ELF segments of the interpreted with correct permissions, as specified by program headers
   - Perform relocations (R_X86_64_RELATIVE, R_X86_64_GLOB_DAT, etc.)
   - Set up auxiliary vector (auxv) entries:
     - AT_PHDR, AT_PHENT, AT_PHNUM
@@ -168,7 +169,7 @@ uwrx/
 #### 3.2 Self-Loader (`src/manager/loader.zig`)
 - **Tasks**:
   - On startup, mmap UWRX binary to high addresses (near top of user space)
-  - Relocate and jump to high-address copy
+  - Jump to high-address copy (uwrx should be statically linked and a PIC to make this easier)
   - From high-address copy:
     - Set up reduced address space for target executable
     - Load target executable's interpreter (ld.so)
@@ -178,7 +179,7 @@ uwrx/
 - **Tasks**:
   - Create BPF filter that:
     - Returns `SECCOMP_RET_USER_NOTIF` for intercepted syscalls
-    - Returns `SECCOMP_RET_ALLOW` for safe syscalls
+    - Returns `SECCOMP_RET_ALLOW` for uninteresting syscalls
   - Syscalls to intercept:
     - Process: `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `exit`, `exit_group`
     - File: `open`, `openat`, `openat2`, `creat`, `unlink`, `unlinkat`, `rename`, `renameat`, `renameat2`, `mkdir`, `mkdirat`, `rmdir`, `stat`, `fstat`, `lstat`, `fstatat`, `access`, `faccessat`, `readlink`, `readlinkat`, `chmod`, `fchmod`, `fchmodat`, `chown`, `fchown`, `lchown`, `fchownat`, `utimensat`, `futimesat`
@@ -199,7 +200,7 @@ uwrx/
       - Custom return value / errno for modified syscalls
   - Handlers for each syscall category:
     - **Process spawning**: Intercept clone/fork/execve to set up manager thread in child
-    - **File operations**: Redirect through overlay filesystem
+    - **File operations**: Redirect through uwrx overlay filesystem, as implemented by uwrx (this is in-process)
     - **Network**: Redirect through supervisor's sockets
     - **Random**: Return PRNG-generated values
     - **Time**: Return deterministic time values
@@ -208,10 +209,8 @@ uwrx/
 - **Tasks**:
   - Create Unix domain socket pair for low-latency IPC
   - Protocol messages:
-    - `SPAWN_CHILD` - Request to spawn supervised child
+    - `PROCESS_START` - Notify process start
     - `OPEN_SOCKET` - Request supervisor to open network socket
-    - `DNS_LOOKUP` - Request DNS resolution
-    - `FILE_OPEN` - Request file open through overlay
     - `PROCESS_EXIT` - Notify process termination
   - Use eventfd for synchronization where needed
 
@@ -228,11 +227,11 @@ uwrx/
     - `ProcessDescriptor`, `ThreadDescriptor`
     - `ClockSnapshot` for custom timestamp clock
   - Use incremental encoding with `TrackEventDefaults`
-  - Implement DEFLATE compression wrapper
+  - Implement DEFLATE compression wrapper (only for final, merged trace)
 
 #### 4.2 Trace Buffer (`src/tracing/buffer.zig`)
 - **Tasks**:
-  - Open trace file in tmpfs using process pid as filename
+  - Open trace file in "traces/" using process pid as filename
   - mmap 1MB window with `MAP_SHARED | MAP_POPULATE`
   - Track write offset within window
   - When write_offset > (1MB - MAX_EVENT_SIZE):
@@ -283,18 +282,19 @@ uwrx/
 #### 5.1 Loopback IP Allocation (`src/network/loopback.zig`)
 - **Tasks**:
   - Maintain domain -> loopback IP mapping
-  - Allocate random IPs from 127.0.0.0/8 for IPv4
-  - Allocate from ::1/128 range for IPv6
+  - Allocate random IPs from 127.0.0.0/8 for IPv4 (avoid 127.0.0.0/24 and 127.255.255.0/24)
+  - Allocate from ::1/128 range for IPv6 (similarly, avoid addresses with existing meaning)
   - Persist mappings in trace: `net/<domain>/ip4.txt`, `ip6.txt`
   - Reverse lookup: loopback IP -> domain
 
 #### 5.2 DNS Server (`src/network/dns.zig`)
 - **Tasks**:
-  - Bind UDP socket on 127.0.0.1:53 (or use DNS interception)
+  - Bind UDP socket on 127.0.0.1:53 (also use DNS interception)
+  - expose fake /etc/resolv.conf with this address
   - Parse DNS queries (A, AAAA records)
   - For each domain lookup:
     - In capture mode: Perform real DNS lookup, record result
-    - In replay mode: Return recorded result
+    - In replay mode: Do nothing
   - Return allocated loopback IP instead of real IP
   - Record DNS events in trace
 
@@ -351,6 +351,7 @@ uwrx/
   - Special paths:
     - CA certificate locations (inject CA cert)
     - /dev/urandom, /dev/random (redirect to PRNG)
+    - /etc/resolv.conf
 
 #### 6.3 Whiteout Handling (`src/filesystem/whiteout.zig`)
 - **Tasks**:
@@ -377,7 +378,7 @@ uwrx/
   - Generate root seed on fresh run, store in `seed.txt`
   - Load seed on replay
   - Implement hierarchical derivation:
-    - Each process gets derived seed from parent's seed + pid
+    - Each process gets derived seed from parent's seed + pid of a matching process from replay trace
     - Thread-local PRNG state
   - Service getrandom() syscalls
   - Provide AT_RANDOM bytes
@@ -394,14 +395,11 @@ uwrx/
     - Frozen time (always same value)
     - Advancing time (controlled increment)
 
-#### 7.3 Replay Logic (`src/reproducibility/replay.zig`)
+#### 7.3 Parent Logic (`src/reproducibility/parent.zig`)
 - **Tasks**:
-  - Load trace to replay
-  - Match current syscalls with recorded events
   - For network: Return recorded responses
-  - For file operations: Use recorded file states
-  - Track divergence for debugging
-
+  - For file operations: Use "files" in the overlay
+  
 ---
 
 ### Phase 8: Partial Rebuild
@@ -414,12 +412,12 @@ uwrx/
 
 #### 8.2 Cache Hit Detection (`src/rebuild/cache.zig`)
 - **Tasks**:
-  - For each process in parent trace:
-    - Collect all read file paths
-    - Compute content hashes or use timestamps
+  - For each process in replay trace:
+    - Collect all read and written file and directory paths
+    - See if no changes in layers above
   - On current run:
     - Before executing whitelisted process:
-    - Check if all read files are unchanged
+    - Check if all read files and directories are unchanged
     - Account for different parent trace sets
 
 #### 8.3 Process Skipping (`src/rebuild/skip.zig`)
@@ -428,7 +426,6 @@ uwrx/
     - Don't actually execute the process
     - Replay stdout/stderr from parent trace
     - Replay exit status
-    - Copy modified files from parent trace
   - Record skip event in trace
 
 ---
