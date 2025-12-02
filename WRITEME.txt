@@ -5,7 +5,7 @@ OVERVIEW
 urwx runs as a supervisor of a process tree.
 Supervisor
   registers as subreaper,
-  initializes tmpfs directory where it will monitor, read and drain trace files,
+  initializes temp directory where it will monitor, read and drain trace files,
   runs dns and proxy server logic,
   cleans up when subprocess finishes or when it is terminated.
 It then launches the process that was given on command line after "--" in the
@@ -16,44 +16,45 @@ Supervisor is responsible for updating read-write layers that have been modified
 SOURCES
 
 Processes need input files to work with. uwrx uses read-only sources as the base layer of the filesystem.
-Without sources, processes would see an empty filesystem (except for system paths).
+Without sources, processes would see an empty filesystem.
 
 Sources are specified via command line:
   --source <dst>[:<priority>]=<source>
 
 where:
   dst      - destination path where source is mounted (required)
-  priority - ordering priority, default 100 (optional)
+  priority - ordering priority, default 0 (optional)
   source   - the source specification (required)
 
 Source types (extensible, more can be added):
   /path/to/dir                    - host directory (initial implementation)
-  tar:/path/to/file.tar[!/subpath] - tarball, optionally with subpath
-  git:/path/to/repo[!treeish]     - git repository with optional treeish (default HEAD)
-  oci:image:tag[!/subpath]        - OCI image, optionally with subpath
-  squashfs:/path/to/file[!/subpath] - squashfs image, optionally with subpath
+  tar:/path/to/file.tar[:/subpath] - tarball, optionally with subpath
+  git:/path/to/repo[:treeish]     - git repository with optional treeish (default HEAD)
+  oci:image:tag[:/subpath]        - OCI image, optionally with subpath
+  squashfs:/path/to/file[:/subpath] - squashfs image, optionally with subpath
 
 Examples:
   --source /src=/home/user/myproject
-  --source /usr:50=/nix/store/abc-glibc
-  --source /opt=tar:/path/to/sdk.tar.gz!/sdk-1.0
-  --source /repo=git:/path/to/repo.git!v1.2.3
+  --source /usr:-5=/nix/store/abc-glibc
+  --source /opt=tar:/path/to/sdk.tar.gz:sdk-1.0
+  --source /repo=git:/path/to/repo.git:main:src/ext
 
 Source ordering (for overlapping paths):
-  1. lower priority number wins (priority 50 beats priority 100)
-  2. if same priority, longer dst path wins (more specific mount)
+  1. higher priority number wins (priority 50 beats priority 0, priority 0 beats priority -50)
+  2. if same priority, later trace layers win (parent is overriden by a derived trace)
+  2. if same priority and trace, longer dst path wins (more specific mount)
   3. sources are layered on top of each other, first match wins for file lookups
 
 File resolution order during process execution:
-  1. files-<pid>/<path> (current run overwrites, pid < current)
-  2. files/<path> (current run first writes)
-  3. parent traces' files/ directories
+  1. bundled data overlay for current bundled executable (if uwrx has bundled executables, and one of them is executing)
+  2. files-<pid>/<path> (current run overwrites, pid <= current)
+  3. files/<path> (current run first writes)
   4. sources (in priority order)
-  5. bundled data overlay (if uwrx has bundled executables)
+  5. parent traces' files-pid/ and files/ and sources directories
   - real filesystem is NOT directly accessible (isolation)
 
 Source specifications are saved in the attempt's "sources" file for reproducibility.
-On replay, sources must be available at the same paths or remapped via options.
+On replay, sources must be available at the same paths with the same contents.
 
 SUPERVISION
 
@@ -92,11 +93,11 @@ attempt directory has following files:
     custom timestamp_clock_id with is_incremental an TrackEventDefaults аre used to reduce trace size.
   ca.pem - mitm proxy CA certificate
   seed.txt - PRNG seed, in hex
-  sources - source specifications, one per line:
+  sources.txt - source specifications, one per line:
     <dst>\t<priority>\t<source_type>\t<source_spec>
     where source_type is: host, tar, git, oci, squashfs
     this allows reproducing the exact source configuration
-  files/ - directory structure tracking file modifications per-process
+  files/, files-<pid>/ - directory structure tracking file modifications per-process
     this is essential for partial rebuild: when determining if a process can be skipped, we need to know
     exactly which version of each file it read. if process A writes foo.txt, process B reads it, then
     process C overwrites foo.txt - we need B's input version preserved to correctly determine if B can be skipped.
@@ -104,45 +105,38 @@ attempt directory has following files:
     structure:
       files/<path>            - first written version of each file (original)
       files-<pid>/<path>      - overwrite by process <pid> (only if file already existed in files/)
-    note: files-<pid>/ not files/<pid>/ - otherwise can't distinguish /123/foo (normal path) from pid folder.
 
     process pids are deterministic, allocated by uwrx (not actual OS pids):
       - supervisor is pid 1
       - spawned processes get 2, 3, 4, ... in spawn order
       - mapping to actual OS pids kept in supervisor
       - on replay, processes get matching pids from trace (handles racy scheduling)
+      - if a non-matching process is started on reply, it gets "version-like" pid
+        3.1 - a new unmatched process was launched before pid 4
+        3.1.2 - on next replay, second of two unmatched processes that launched before pid 4
+        inside managed processes, normal sequential pid values are used, that are translated to these
+        strings by supervisor. the pid mapping (host/numeric internal/ordered string) is recorded in trace event
 
     when a process writes a file:
       - if file doesn't exist in files/: write to files/<path>
       - if file already exists in files/: write to files-<pid>/<path>
 
     this keeps most files directly in files/, per-pid directories only for conflicts.
-    files can be deduplicated via hardlinks or reflinks when content is identical.
 
     if files were deleted, a 0/0 char device whiteout is created, same as used in overlayfs.
 
     during process P execution, file reads resolve as follows:
-      1. find all files-<pid>/<path> where pid < P (versions written before P ran)
-      2. use the one with largest such pid
-      3. if none exist, use files/<path> (the original first version)
-      4. if not in files/ at all, check parent traces' files/ directories
-      5. check sources (in priority order)
-      6. check bundled data overlay (if uwrx has bundled executables)
+      1. check bundled data overlay for the currently running bundled executable (if uwrx has launced a bundled executable)
+      2. find all files-<pid>/<path> where pid <= P (versions written by P or before P ran)
+      3. use the one with largest such pid
+      4. if none exist, use files/<path> (the original first version)
+      6. check sources of this trace (in priority order)
+      5. if not in files/ or sources at all, check parent traces' files-<pid>/ and files/ and sources
       - real filesystem is NOT directly accessible (isolation)
 
     no need to record pid for files in base files/ - pid ordering determines visibility:
-    if P's pid is smaller than all files-<pid>/ containing the file, P sees the original.
+    if P's pid is smaller than all files-<pid>/ containing the file, and P has modified a file, that file is in base files/.
 
-  files.meta - tracks file operations for inspection and debugging
-    tab-separated entries, appended as operations occur:
-      <relative_path>\t<pid>\t<operation>\t<exec_path>
-    where:
-      relative_path - path relative to files/ (without pid/ prefix)
-      pid - process id that performed the modification
-      operation - one of: create, write, delete, rename_to, rename_from, mkdir, rmdir, chmod, chown
-      exec_path - the executable path of the process
-    the actual version resolution uses pid ordering and directory structure, not this file.
-    this file enables inspection tools to answer "which process created/modified this file?"
   net/<domain_name>/<path>/ ... /<path>/<file> - a file saved by proxy
   net/<domain_name>/<path>/ ... /<path>/<repo>.git/ - a bare mirror repository saved by proxy 
   net/<domain_name>/cert.pem - if there was https connection to this domain, this is the mitm certificate generated for it
@@ -158,7 +152,7 @@ attempt directory has following files:
     and to see impact of cached network requests and partial rebuild speedups.
     replay can have different set of parent traces (as a part of, say, edit/rebuild cycle)
 
-Each monitor thread opens a file in a tmpfs directory created by the supervisor using it's pid as a filename.
+Each monitor thread opens a file in a temp directory created by the supervisor using it's pid as a filename.
 Events to the file are written in perfetto trace format. To avoid syscall overhead per write, the file is mmaped in
 a 1MB window using MAP_POPULATE, that advances forward by 1MB-MAX_EVENT_SIZE (rounded down to whole pages)
 wherever writing offset is less that MAX_EVENT_SIZE from the end of the buffer after the write.
@@ -167,7 +161,7 @@ still exists. if process does not exist, the file is read and processed complete
 Otherwise, at least 1MB from the end of file (as can be determined by e.g. SEEK_HOLE) is left unprocessed, to avoid reading
 partially written data.
 Events are processed (filtered, printed if needed) and merged into one perfetto trace that is compressed and saved onto disk.
-To avoid excessive tmpfs use, supervisor discards already read data by using fallocate with FALLOC_FL_PUNCH_HOLE and FALLOC_FL_KEEP_SIZE
+To avoid excessive temp space use, supervisor discards already read data by using fallocate with FALLOC_FL_PUNCH_HOLE and FALLOC_FL_KEEP_SIZE
 to discard completely read pages from the start of the file.
 
 ISOLATION
@@ -190,7 +184,7 @@ REPRODUCIBILITY
 
 uwrx tries to make subprocess runs reproducible in many ways.
   Random is generated using hierarchy of PRNGs that has seed chosen and saved in the trace. This covers AT_RANDOM, /dev/urandom etc.
-    on trace replay, random values are the same.
+    on trace replay, random values are the same. PCG is used due to it's features (multiple streams) and simplicity.
   Timestamps are the same for each filesystem layer. Lower layers are older, higher layers are newer. This has no relation to actual
     file timestamps on disk.
   Network connections are intercepted and replayed from the recorded, intercepted information.
@@ -227,15 +221,15 @@ this allows uwrx to be distributed as a single binary containing a complete tool
 
 Bundle structure:
   uwrx binary contains:
-    - uwrx supervisor and manager code
-    - bundled executables section: statically linked, relocatable binaries (e.g., gcc, ld, as, ar)
-    - bundled data section: compressed filesystem overlay with files normally installed with those programs
+    - uwrx supervisor and manager code (the uwrx itself)
+    - bundled executables sections: statically linked, relocatable binaries (e.g., gcc, ld, as, ar)
+    - bundled data sections: compressed filesystem overlay with files normally installed with those programs
       (headers, libraries, specs files, etc.)
 
 Bundled executables must be:
   - statically linked (no external dependencies)
   - position-independent / relocatable (can run from any address)
-  - self-contained (all needed data files bundled in data section)
+  - all needed data files should be bundled in corresponding data section
 
 Execution of bundled programs:
   when manager thread intercepts execve() for a bundled executable:
@@ -246,32 +240,34 @@ Execution of bundled programs:
 
 File access for bundled programs:
   when a bundled program reads files (e.g., gcc reading headers):
-    - the bundled data section provides an implicit source layer
-    - this layer has lowest priority (checked after all other sources)
+    - the bundled data section corresponding to the executable provides an implicit source layer
+    - this layer has highest priority (checked before all other sources)
     - contains files that would normally be installed with the program:
       /usr/include/*, /usr/lib/gcc/*, etc.
 
 Bundle creation:
   uwrx provides a command to create bundles:
-    uwrx bundle --output <path> --add <name>=<executable> --data <overlay.squashfs>
+    uwrx bundle --output <path> --add <name>=<executable> --data <source>
 
   the bundle command:
     - takes uwrx as base
-    - adds specified executables to the bundled executables section
-    - adds data overlay to the bundled data section
+    - adds specified executable to a new bundled executables section
+    - adds data overlay to a new bundled data section
     - produces a new uwrx binary with everything included
 
 Symlink/hardlink invocation (like busybox):
-  if uwrx is invoked via a symlink or hardlink named after a bundled executable:
+  if uwrx is invoked via a symlink named after a bundled executable:
     uwrx automatically runs that executable under supervision
   example:
     ln -s uwrx gcc
     ./gcc -c foo.c    # equivalent to: uwrx run -- gcc -c foo.c
+  In this mode (uwrx followed by a command without preceeding --, or through a symlink), no supervisor is started and
+  no traces are written, to allow using included binaries normally.
 
 File resolution with bundles (updated order):
-  1. files-<pid>/<path> (current run overwrites, pid < current)
-  2. files/<path> (current run first writes)
-  3. parent traces' files/ directories
+  1. bundled data overlay (implicit, highest priority)
+  2. files-<pid>/<path> (current run overwrites, pid < current)
+  3. files/<path> (current run first writes)
   4. sources (in priority order)
-  5. bundled data overlay (implicit, lowest priority)
+  5. parent files and sources 
   - real filesystem is NOT directly accessible (isolation)

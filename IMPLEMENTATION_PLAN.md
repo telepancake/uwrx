@@ -161,7 +161,9 @@ uwrx/
   - Allocate deterministic pids (not OS pids):
     - Supervisor is pid 1
     - Spawned processes get 2, 3, 4, ... in spawn order
-    - Maintain mapping: uwrx_pid <-> actual_os_pid
+    - fractional, versioned ids for unmatched processes during replay
+    - Maintain mapping: uwrx_pid <-> actual_os_pid <-> textual ordered pid
+    - mapping is saved to trace event
     - On replay, processes get matching pids from trace (handles racy scheduling)
   - Track all supervised processes (uwrx_pid -> process info map)
   - Handle process creation notifications from manager threads
