@@ -18,6 +18,7 @@ pub const reproducibility = @import("reproducibility/mod.zig");
 pub const rebuild = @import("rebuild/mod.zig");
 pub const inspect = @import("inspect/mod.zig");
 pub const bundle = @import("bundle/mod.zig");
+pub const testing = @import("test/mod.zig");
 
 /// Global allocator for uwrx
 pub var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -134,7 +135,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !struct
             i += 1;
         } else if (std.mem.eql(u8, arg, "test")) {
             cmd = .@"test";
-            i += 1;
+            // Test command handles its own arguments
+            return .{ .cmd = cmd, .opts = opts };
         } else if (std.mem.eql(u8, arg, "ui")) {
             cmd = .ui;
             i += 1;
@@ -226,7 +228,7 @@ fn printHelp() void {
         \\
         \\COMMANDS:
         \\    run         Supervise a command with tracing
-        \\    test        Run a test case
+        \\    test        Run integrated test suite
         \\    ui          Examine a trace interactively
         \\    inspect     Inspect trace contents
         \\    bundle      Create bundled uwrx with executables
@@ -300,7 +302,8 @@ pub fn main() !void {
             try supervisor.run(allocator, &opts);
         },
         .@"test" => {
-            std.debug.print("Test command not yet implemented\n", .{});
+            const exit_code = try testing.runAll(allocator, args);
+            std.process.exit(exit_code);
         },
         .ui => {
             try inspect.runTui(allocator, &opts);
@@ -365,4 +368,5 @@ test {
     _ = rebuild;
     _ = inspect;
     _ = bundle;
+    _ = testing;
 }
