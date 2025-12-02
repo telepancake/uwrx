@@ -33,10 +33,10 @@ pub const Supervisor = struct {
         errdefer temp_state.deinit();
 
         // Initialize process state
-        var process_state = lifecycle.ProcessState.init(allocator);
+        const process_state = lifecycle.ProcessState.init(allocator);
 
         // Initialize collector
-        var collector_state = try collector.Collector.init(allocator, temp_state.traces_dir);
+        const collector_state = try collector.Collector.init(allocator, temp_state.traces_dir);
 
         return .{
             .allocator = allocator,

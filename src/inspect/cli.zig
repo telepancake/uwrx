@@ -146,11 +146,8 @@ fn runProcs(_: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    // Load and parse trace
-    _ = trace_path;
-    _ = show_tree;
-
-    std.debug.print("Process listing not yet implemented\n", .{});
+    // Load and parse trace (not yet implemented)
+    std.debug.print("Process listing not yet implemented for {s} (tree={any})\n", .{ trace_path, show_tree });
 }
 
 /// Show output
@@ -167,10 +164,7 @@ fn runOutput(_: std.mem.Allocator, args: []const []const u8) !void {
         filter_pid = std.fmt.parseInt(u32, args[4], 10) catch null;
     }
 
-    _ = trace_path;
-    _ = filter_pid;
-
-    std.debug.print("Output display not yet implemented\n", .{});
+    std.debug.print("Output display not yet implemented for {s} (pid={any})\n", .{ trace_path, filter_pid });
 }
 
 /// List events
@@ -181,9 +175,8 @@ fn runEvents(_: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const trace_path = args[3];
-    _ = trace_path;
 
-    std.debug.print("Event listing not yet implemented\n", .{});
+    std.debug.print("Event listing not yet implemented for {s}\n", .{trace_path});
 }
 
 test "CLI help" {

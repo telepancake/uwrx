@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = false,
+        .link_libc = true, // Required for std.posix functions
         .pic = true, // Position-independent code for self-loading
     });
 

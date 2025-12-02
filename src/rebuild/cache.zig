@@ -64,7 +64,7 @@ pub const CacheState = struct {
     }
 
     /// Load process inputs from replay trace
-    pub fn loadFromReplay(self: *CacheState, trace_path: []const u8) !void {
+    pub fn loadFromReplay(_: *CacheState, trace_path: []const u8) !void {
         _ = trace_path;
         // Parse trace and extract file access patterns per process
         // This would read the perfetto trace and extract read/write events

@@ -26,7 +26,7 @@ pub const TimestampState = struct {
     }
 
     /// Get timestamp for a given layer
-    pub fn getLayerTimestamp(self: *const TimestampState, layer_index: u32) i64 {
+    pub fn getLayerTimestamp(_: *const TimestampState, layer_index: u32) i64 {
         return BASE_TIMESTAMP + @as(i64, layer_index) * LAYER_INTERVAL;
     }
 

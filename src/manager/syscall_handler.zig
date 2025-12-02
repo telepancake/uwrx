@@ -233,7 +233,7 @@ fn handleTime(_: *HandlerContext, notif: *const linux.SeccompNotif) linux.Seccom
 
 test "handler context initialization" {
     const allocator = std.testing.allocator;
-    var ctx = HandlerContext{
+    const ctx = HandlerContext{
         .allocator = allocator,
         .seccomp_fd = -1,
     };

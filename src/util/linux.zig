@@ -4,7 +4,7 @@
 const std = @import("std");
 const os = std.os;
 const linux = std.os.linux;
-const fd_t = linux.fd_t;
+pub const fd_t = linux.fd_t;
 
 // ============================================================================
 // prctl constants and wrapper

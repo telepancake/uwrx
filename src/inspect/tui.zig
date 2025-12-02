@@ -132,12 +132,12 @@ pub const TuiState = struct {
         try writer.print("Exit:    {d}\n", .{proc.exit_status});
     }
 
-    fn renderFileList(self: *TuiState, writer: anytype) !void {
+    fn renderFileList(_: *TuiState, writer: anytype) !void {
         try writer.writeAll("Files:\n\n");
         try writer.writeAll("  (not implemented)\n");
     }
 
-    fn renderEventList(self: *TuiState, writer: anytype) !void {
+    fn renderEventList(_: *TuiState, writer: anytype) !void {
         try writer.writeAll("Events:\n\n");
         try writer.writeAll("  (not implemented)\n");
     }
@@ -188,7 +188,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     const writer = stdout.writer();
 
     // Set raw mode
-    var original_termios = try std.posix.tcgetattr(stdin.handle);
+    const original_termios = try std.posix.tcgetattr(stdin.handle);
     var raw = original_termios;
     raw.lflag.ECHO = false;
     raw.lflag.ICANON = false;

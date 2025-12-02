@@ -52,7 +52,7 @@ pub const ProxyState = struct {
         const domain = self.loopback_state.reverseLookup(ip_str) orelse return error.UnknownDomain;
 
         // Create connection handler
-        var conn = Connection{
+        const conn = Connection{
             .allocator = self.allocator,
             .client_fd = client_fd,
             .domain = domain,
@@ -112,7 +112,7 @@ pub const Connection = struct {
         // TODO: Implement TLS handshake and proxying
     }
 
-    fn handleHttp(self: *Connection, initial_data: []const u8) !void {
+    fn handleHttp(_: *Connection, initial_data: []const u8) !void {
         // Parse HTTP request
         const request = try HttpRequest.parse(initial_data);
         _ = request;

@@ -77,8 +77,8 @@ pub const SupervisorConnection = struct {
         // Create socket pair for recv
         var recv_pair: [2]linux.fd_t = undefined;
         if (std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &recv_pair) != 0) {
-            std.os.linux.close(send_pair[0]);
-            std.os.linux.close(send_pair[1]);
+            _ = std.os.linux.close(send_pair[0]);
+            _ = std.os.linux.close(send_pair[1]);
             return error.SocketPairFailed;
         }
 
@@ -92,25 +92,25 @@ pub const SupervisorConnection = struct {
 
     /// Close parent-side fds (call in child after fork)
     pub fn closeParentEnd(self: *SupervisorConnection) void {
-        std.os.linux.close(self.parent_send_fd);
-        std.os.linux.close(self.parent_recv_fd);
+        _ = std.os.linux.close(self.parent_send_fd);
+        _ = std.os.linux.close(self.parent_recv_fd);
         self.parent_send_fd = -1;
         self.parent_recv_fd = -1;
     }
 
     /// Close child-side fds (call in parent after fork)
     pub fn closeChildEnd(self: *SupervisorConnection) void {
-        std.os.linux.close(self.send_fd);
-        std.os.linux.close(self.recv_fd);
+        _ = std.os.linux.close(self.send_fd);
+        _ = std.os.linux.close(self.recv_fd);
         self.send_fd = -1;
         self.recv_fd = -1;
     }
 
     pub fn deinit(self: *SupervisorConnection) void {
-        if (self.send_fd >= 0) std.os.linux.close(self.send_fd);
-        if (self.recv_fd >= 0) std.os.linux.close(self.recv_fd);
-        if (self.parent_send_fd >= 0) std.os.linux.close(self.parent_send_fd);
-        if (self.parent_recv_fd >= 0) std.os.linux.close(self.parent_recv_fd);
+        if (self.send_fd >= 0) _ = std.os.linux.close(self.send_fd);
+        if (self.recv_fd >= 0) _ = std.os.linux.close(self.recv_fd);
+        if (self.parent_send_fd >= 0) _ = std.os.linux.close(self.parent_send_fd);
+        if (self.parent_recv_fd >= 0) _ = std.os.linux.close(self.parent_recv_fd);
     }
 
     /// Send a message to the supervisor

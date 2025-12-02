@@ -132,7 +132,7 @@ pub const LoopbackState = struct {
         const word1 = random.int(u16);
         const word2 = random.int(u16);
 
-        var ip_str = try self.allocator.alloc(u8, 32);
+        const ip_str = try self.allocator.alloc(u8, 32);
         const len = std.fmt.bufPrint(ip_str, "::1:{x:0>4}:{x:0>4}", .{ word1, word2 }) catch unreachable;
         return self.allocator.realloc(ip_str, len.len) catch ip_str;
     }

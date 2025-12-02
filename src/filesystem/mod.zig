@@ -21,7 +21,7 @@ pub const FilesystemState = struct {
         var overlay_state = try overlay.OverlayState.init(allocator, config.sources, config.parents);
         errdefer overlay_state.deinit();
 
-        var meta_tracker = meta.MetaTracker.init(allocator, config.files_dir);
+        const meta_tracker = meta.MetaTracker.init(allocator, config.files_dir);
 
         return .{
             .allocator = allocator,

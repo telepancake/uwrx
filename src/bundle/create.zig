@@ -181,7 +181,7 @@ fn addExecutableSection(allocator: std.mem.Allocator, output_file: std.fs.File, 
     };
 
     // Get entry point from ELF
-    const ehdr: *const elf.Elf64_Ehdr = @ptrCast(exe_content.ptr);
+    const ehdr: *const elf.Elf64_Ehdr = @ptrCast(@alignCast(exe_content.ptr));
     header.entry_offset = @truncate(ehdr.e_entry);
 
     // Seek to end
@@ -202,7 +202,7 @@ fn addDataSection(_: std.mem.Allocator, _: std.fs.File, _: DataSpec) !void {
 fn isValidBundleCandidate(content: []const u8) bool {
     if (content.len < @sizeOf(elf.Elf64_Ehdr)) return false;
 
-    const ehdr: *const elf.Elf64_Ehdr = @ptrCast(content.ptr);
+    const ehdr: *const elf.Elf64_Ehdr = @ptrCast(@alignCast(content.ptr));
 
     // Check ELF magic
     if (!std.mem.eql(u8, ehdr.e_ident[0..4], &elf.ELF_MAGIC)) return false;

@@ -48,7 +48,7 @@ pub fn loadBundledSections(state: *mod.BundleState) !void {
 
     try file.seekTo(ehdr.e_shoff);
 
-    var shdrs = try state.allocator.alloc(elf.Elf64_Shdr, ehdr.e_shnum);
+    const shdrs = try state.allocator.alloc(elf.Elf64_Shdr, ehdr.e_shnum);
     defer state.allocator.free(shdrs);
 
     const shdrs_bytes = std.mem.sliceAsBytes(shdrs);

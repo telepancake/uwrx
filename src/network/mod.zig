@@ -30,7 +30,7 @@ pub const NetworkState = struct {
         var tls_state = try tls.TlsState.init(allocator);
         errdefer tls_state.deinit();
 
-        var proxy_state = try proxy.ProxyState.init(allocator, &loopback_state, &tls_state);
+        const proxy_state = try proxy.ProxyState.init(allocator, &loopback_state, &tls_state);
 
         return .{
             .allocator = allocator,

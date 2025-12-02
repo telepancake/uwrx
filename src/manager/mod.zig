@@ -61,7 +61,8 @@ pub fn spawnManaged(
     const uwrx_pid = sup.process_state.allocateUwrxPid();
 
     // Fork the process
-    const pid = std.os.linux.fork();
+    const fork_result = std.os.linux.fork();
+    const pid: std.os.linux.pid_t = @bitCast(@as(u32, @truncate(fork_result)));
 
     if (pid == 0) {
         // Child process

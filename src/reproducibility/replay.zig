@@ -173,7 +173,7 @@ pub const ReplayState = struct {
         defer self.allocator.free(trace_data);
 
         // Parse trace data (simplified - would parse protobuf in reality)
-        _ = trace_data;
+        // trace_data is freed via defer above
     }
 
     /// Get cached network response
