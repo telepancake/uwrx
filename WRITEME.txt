@@ -11,7 +11,48 @@ Supervisor
 It then launches the process that was given on command line after "--" in the
 environment specified by the options.
 During operation it collects and displays/saves traces from subprocesses.
-Supervisor is responsible for updating read-write layers that have been modified. 
+Supervisor is responsible for updating read-write layers that have been modified.
+
+SOURCES
+
+Processes need input files to work with. uwrx uses read-only sources as the base layer of the filesystem.
+Without sources, processes would see an empty filesystem (except for system paths).
+
+Sources are specified via command line:
+  --source <dst>[:<priority>]=<source>
+
+where:
+  dst      - destination path where source is mounted (required)
+  priority - ordering priority, default 100 (optional)
+  source   - the source specification (required)
+
+Source types (extensible, more can be added):
+  /path/to/dir                    - host directory (initial implementation)
+  tar:/path/to/file.tar[!/subpath] - tarball, optionally with subpath
+  git:/path/to/repo[!treeish]     - git repository with optional treeish (default HEAD)
+  oci:image:tag[!/subpath]        - OCI image, optionally with subpath
+  squashfs:/path/to/file[!/subpath] - squashfs image, optionally with subpath
+
+Examples:
+  --source /src=/home/user/myproject
+  --source /usr:50=/nix/store/abc-glibc
+  --source /opt=tar:/path/to/sdk.tar.gz!/sdk-1.0
+  --source /repo=git:/path/to/repo.git!v1.2.3
+
+Source ordering (for overlapping paths):
+  1. lower priority number wins (priority 50 beats priority 100)
+  2. if same priority, longer dst path wins (more specific mount)
+  3. sources are layered on top of each other, first match wins for file lookups
+
+File resolution order during process execution:
+  1. files-<pid>/<path> (current run overwrites, pid < current)
+  2. files/<path> (current run first writes)
+  3. parent traces' files/ directories
+  4. sources (in priority order)
+  - real filesystem is NOT directly accessible (isolation)
+
+Source specifications are saved in the attempt's "sources" file for reproducibility.
+On replay, sources must be available at the same paths or remapped via options.
 
 SUPERVISION
 
@@ -50,6 +91,10 @@ attempt directory has following files:
     custom timestamp_clock_id with is_incremental an TrackEventDefaults аre used to reduce trace size.
   ca.pem - mitm proxy CA certificate
   seed.txt - PRNG seed, in hex
+  sources - source specifications, one per line:
+    <dst>\t<priority>\t<source_type>\t<source_spec>
+    where source_type is: host, tar, git, oci, squashfs
+    this allows reproducing the exact source configuration
   files/ - directory structure tracking file modifications per-process
     this is essential for partial rebuild: when determining if a process can be skipped, we need to know
     exactly which version of each file it read. if process A writes foo.txt, process B reads it, then
@@ -80,7 +125,8 @@ attempt directory has following files:
       2. use the one with largest such pid
       3. if none exist, use files/<path> (the original first version)
       4. if not in files/ at all, check parent traces' files/ directories
-      5. finally, real filesystem
+      5. finally, check sources (in priority order)
+      - real filesystem is NOT directly accessible (isolation)
 
     no need to record pid for files in base files/ - pid ordering determines visibility:
     if P's pid is smaller than all files-<pid>/ containing the file, P sees the original.

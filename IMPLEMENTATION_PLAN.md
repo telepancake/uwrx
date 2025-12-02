@@ -48,6 +48,14 @@ uwrx/
 │   │   ├── whiteout.zig         # Whiteout (deletion) handling
 │   │   ├── timestamp.zig        # Timestamp/permission squashing
 │   │   └── meta.zig             # File modification metadata tracking
+│   ├── sources/
+│   │   ├── mod.zig              # Sources module root
+│   │   ├── types.zig            # Source type definitions and parsing
+│   │   ├── host.zig             # Host directory source (initial impl)
+│   │   ├── tar.zig              # Tarball source (future)
+│   │   ├── git.zig              # Git repository source (future)
+│   │   ├── oci.zig              # OCI image source (future)
+│   │   └── squashfs.zig         # Squashfs source (future)
 │   ├── reproducibility/
 │   │   ├── mod.zig              # Reproducibility module root
 │   │   ├── prng.zig             # Hierarchical PRNG system
@@ -110,6 +118,10 @@ uwrx/
       - `--replay <path>` - Trace to replay
       - `--net` / `--no-net` - Network mode. For replay default is off, otherwise default is on
       - `--tmp <path>` - Location where create temporary file directory, default under /tmp
+      - `--source <dst>[:<priority>]=<source>` - Read-only source mapping (repeatable)
+        - dst: destination path where source is mounted
+        - priority: ordering priority, default 100 (lower wins)
+        - source: host path (initial), or tar:/git:/oci:/squashfs: prefixed (future)
     - "test <test> [options]" - run a test case
     - "ui <path>" - examine a trace interactively
   - Initialize logging
@@ -277,6 +289,7 @@ uwrx/
     - `ca.pem` - CA certificate
     - `seed.txt` - PRNG seed (hex)
     - `files.meta` - File modification metadata (process tracking)
+    - `sources` - Source specifications (dst, priority, type, spec per line)
   - Manage `files/` directory with whiteouts
   - Manage `net/` directory structure
   - Handle `parent/` symlinks
@@ -342,13 +355,14 @@ uwrx/
 
 #### 6.1 Overlay Filesystem (`src/filesystem/overlay.zig`)
 - **Tasks**:
-  - Build layered view from parent traces and per-process versions
+  - Build layered view from sources, parent traces, and per-process versions
   - For process P reading file X, resolution order:
     1. Find all `files-<pid>/X` where `pid < P` (versions written before P ran)
     2. Use the one with largest such pid
     3. If none exist, use `files/X` (the original first version)
     4. If not in `files/` at all, check parent traces' `files/` directories
-    5. Finally, real filesystem (read-only base)
+    5. Check sources (in priority order: lower priority number wins, longer dst wins on tie)
+    - Real filesystem is NOT directly accessible (isolation)
   - Note: `files-<pid>/` not `files/<pid>/` to distinguish from normal paths like `/123/foo`
   - Pids are deterministic (allocated by uwrx), not actual OS pids
   - Handle whiteouts (deleted files) - same resolution logic applies
@@ -399,6 +413,28 @@ uwrx/
   - Provide query interface:
     - `resolveFile(path, as_of_pid) -> ?FilePath` - which actual file would this pid see?
   - Essential for partial rebuild cache hit detection
+
+#### 6.6 Read-Only Sources (`src/sources/`)
+- **Tasks**:
+  - Provide input files as base layer of filesystem (without sources, filesystem is empty)
+  - Parse `--source <dst>[:<priority>]=<source>` command-line options
+  - Source specification format:
+    - dst: destination path where source is mounted
+    - priority: ordering priority, default 100 (lower number wins)
+    - source: type-prefixed specification
+  - Source types (extensible):
+    - `host:` (or bare path) - Host directory (initial implementation)
+    - `tar:` - Tarball with optional `!/subpath` (future)
+    - `git:` - Git repository with optional `!treeish` (future)
+    - `oci:` - OCI image with optional `!/subpath` (future)
+    - `squashfs:` - Squashfs with optional `!/subpath` (future)
+  - Source ordering for overlapping paths:
+    - Lower priority number wins
+    - If same priority, longer dst path wins (more specific mount)
+    - Sources layered, first match wins for file lookups
+  - Save source specifications to attempt's `sources` file
+  - On replay, validate sources available or allow remapping
+  - Initial implementation: only `host.zig` for host directories
 
 ---
 
@@ -519,11 +555,12 @@ uwrx/
 
 ### Milestone 3: File Interception
 1. File syscall interception
-2. Overlay filesystem (single layer)
-3. Path remapping
-4. Timestamp squashing
-5. Multi-layer overlay (parent traces)
-6. Whiteout handling
+2. Read-only sources (host directories only initially)
+3. Overlay filesystem (single layer)
+4. Path remapping
+5. Timestamp squashing
+6. Multi-layer overlay (parent traces)
+7. Whiteout handling
 
 ### Milestone 4: Tracing
 1. Perfetto format writer
