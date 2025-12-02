@@ -150,26 +150,40 @@ fn handleOpen(ctx: *HandlerContext, notif: *const linux.SeccompNotif) linux.Secc
         else => return seccomp.continueResponse(notif.id),
     };
 
-    // Get flags to determine read/write mode
+    // Get flags and mode
     const flags: u32 = blk: {
         const raw_flags: u64 = switch (syscall_nr) {
             linux.SYS.open => notif.data.args[1],
             linux.SYS.creat => 0o100 | 0o1 | 0o1000, // O_CREAT | O_WRONLY | O_TRUNC
             linux.SYS.openat => notif.data.args[2],
             linux.SYS.openat2 => openat2_blk: {
-                // openat2 uses open_how struct: { flags: u64, mode: u64, resolve: u64 }
-                // Read flags field directly from the struct at args[2]
                 const how_ptr = notif.data.args[2];
                 if (how_ptr == 0) {
                     return seccomp.errorResponse(notif.id, @intFromEnum(std.os.linux.E.FAULT));
                 }
-                // The first field is flags (u64)
                 const flags_ptr: *const u64 = @ptrFromInt(how_ptr);
                 break :openat2_blk flags_ptr.*;
             },
             else => 0,
         };
         break :blk @truncate(raw_flags);
+    };
+
+    const mode: u32 = blk: {
+        const raw_mode: u64 = switch (syscall_nr) {
+            linux.SYS.open => notif.data.args[2],
+            linux.SYS.creat => notif.data.args[1],
+            linux.SYS.openat => notif.data.args[3],
+            linux.SYS.openat2 => openat2_blk: {
+                const how_ptr = notif.data.args[2];
+                if (how_ptr == 0) break :openat2_blk 0;
+                // mode is second field in open_how
+                const mode_ptr: *const u64 = @ptrFromInt(how_ptr + 8);
+                break :openat2_blk mode_ptr.*;
+            },
+            else => 0,
+        };
+        break :blk @truncate(raw_mode);
     };
 
     if (path_ptr == 0) {
@@ -180,59 +194,105 @@ fn handleOpen(ctx: *HandlerContext, notif: *const linux.SeccompNotif) linux.Secc
     const path_cstr: [*:0]const u8 = @ptrFromInt(path_ptr);
     const path = std.mem.span(path_cstr);
 
-    // Check for special paths
+    // Handle special paths first
     if (ctx.path_remapper) |remapper| {
-        if (remapper.remap(path)) |remapped| {
-            // Write remapped path to target's buffer
-            // (For now we let the syscall continue since we'd need to allocate new path)
-            _ = remapped;
+        // Handle /dev/urandom and /dev/random - let them through
+        if (remap.PathRemapper.isRandomDevice(path)) {
+            return seccomp.continueResponse(notif.id);
         }
 
-        // Handle /dev/urandom and /dev/random specially
-        if (remap.PathRemapper.isRandomDevice(path)) {
-            // Let it continue - getrandom syscall is intercepted separately
-            return seccomp.continueResponse(notif.id);
+        // Check for remapped paths (CA certs, resolv.conf, etc.)
+        if (remapper.remap(path)) |remapped_path| {
+            // Execute open with remapped path
+            const result = executeOpen(remapped_path, flags, mode);
+            if (result < 0) {
+                return seccomp.errorResponse(notif.id, @intCast(-result));
+            }
+            return seccomp.successResponse(notif.id, result);
         }
     }
 
-    // Check filesystem overlay
     // O_WRONLY=1, O_RDWR=2, O_CREAT=0o100, O_TRUNC=0o1000
     const is_write = (flags & (0o1 | 0o2 | 0o100 | 0o1000)) != 0;
 
+    // Check filesystem overlay
     if (ctx.fs_state) |fs_state| {
         if (is_write) {
-            // Get write path through overlay
+            // Get write path through overlay (copy-on-write)
             const write_path = fs_state.openForWrite(path, notif.pid) catch {
-                // Fall through to normal open
                 return seccomp.continueResponse(notif.id);
             };
             defer ctx.allocator.free(write_path);
 
             // Ensure parent directory exists
-            if (std.fs.path.dirname(write_path)) |parent| {
-                std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
-                    error.PathAlreadyExists => {},
-                    else => {},
-                };
-            }
+            ensureParentDir(write_path);
 
             // Record the modification
             fs_state.recordWrite(path, notif.pid) catch {};
 
-            // For now, continue with original syscall
-            // Full implementation would rewrite the path in memory
-            return seccomp.continueResponse(notif.id);
+            // Execute open with the overlay write path
+            const result = executeOpen(write_path, flags, mode);
+            if (result < 0) {
+                return seccomp.errorResponse(notif.id, @intCast(-result));
+            }
+            return seccomp.successResponse(notif.id, result);
         } else {
-            // Read-only access - check overlay
-            if (fs_state.resolvePath(path, notif.pid) catch null) |_| {
-                // File found in overlay, continue with syscall
-                return seccomp.continueResponse(notif.id);
+            // Read-only: resolve through overlay to find actual file location
+            if (fs_state.resolvePath(path, notif.pid) catch null) |layer_path| {
+                // Build full path: layer_path + original path
+                var full_path_buf: [4096]u8 = undefined;
+                const full_path = std.fmt.bufPrintZ(&full_path_buf, "{s}{s}", .{ layer_path, path }) catch {
+                    return seccomp.continueResponse(notif.id);
+                };
+
+                const result = executeOpen(full_path, flags, mode);
+                if (result < 0) {
+                    return seccomp.errorResponse(notif.id, @intCast(-result));
+                }
+                return seccomp.successResponse(notif.id, result);
             }
         }
     }
 
-    // Let syscall proceed normally
+    // No overlay configured - let syscall proceed with original path
     return seccomp.continueResponse(notif.id);
+}
+
+/// Execute an open syscall with the given path
+fn executeOpen(path: []const u8, flags: u32, mode: u32) i64 {
+    // Need null-terminated path
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) {
+        return -@as(i64, @intFromEnum(std.os.linux.E.NAMETOOLONG));
+    }
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+
+    const result = std.os.linux.syscall4(
+        .openat,
+        @as(usize, @bitCast(@as(isize, std.os.linux.AT.FDCWD))),
+        @intFromPtr(&path_buf),
+        flags,
+        mode,
+    );
+
+    return @bitCast(result);
+}
+
+/// Ensure parent directory exists for a path
+fn ensureParentDir(path: []const u8) void {
+    if (std.fs.path.dirname(path)) |parent| {
+        // Recursively create parent directories
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            error.FileNotFound => {
+                // Parent of parent doesn't exist, recurse
+                ensureParentDir(parent);
+                std.fs.makeDirAbsolute(parent) catch {};
+            },
+            else => {},
+        };
+    }
 }
 
 /// Handle stat/lstat/fstat/newfstatat/statx syscalls
@@ -1045,4 +1105,220 @@ test "gettimeofday handler with null pointer" {
     // Should return success with null pointer (valid behavior)
     try std.testing.expectEqual(@as(i64, 0), resp.val);
     try std.testing.expectEqual(@as(i32, 0), resp.@"error");
+}
+
+// ============================================================================
+// Functional Tests - Verify handlers WORK, not just that they fail correctly
+// ============================================================================
+
+test "executeOpen actually opens a file" {
+    // Create a temp file
+    const tmp_path = "/tmp/uwrx_test_open_file.txt";
+    const content = "test content for executeOpen";
+
+    // Write test file
+    const write_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    try write_file.writeAll(content);
+    write_file.close();
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    // Test executeOpen
+    const result = executeOpen(tmp_path, 0, 0); // O_RDONLY
+    try std.testing.expect(result >= 0); // Should return valid fd
+
+    // Read from the fd and verify content
+    const fd: std.posix.fd_t = @intCast(result);
+    defer std.posix.close(fd);
+
+    var buf: [100]u8 = undefined;
+    const bytes_read = try std.posix.read(fd, &buf);
+    try std.testing.expectEqualStrings(content, buf[0..bytes_read]);
+}
+
+test "executeOpen returns error for nonexistent file" {
+    const result = executeOpen("/nonexistent/path/to/file.txt", 0, 0);
+    try std.testing.expect(result < 0); // Should return negative error
+    try std.testing.expectEqual(-@as(i64, @intFromEnum(std.os.linux.E.NOENT)), result);
+}
+
+test "getrandom handler fills buffer with reproducible data" {
+    const allocator = std.testing.allocator;
+
+    // Create two PRNG states with same seed
+    var prng_state1 = prng.HierarchicalPrng.init(0xDEADBEEF);
+    defer prng_state1.deinit();
+
+    var prng_state2 = prng.HierarchicalPrng.init(0xDEADBEEF);
+    defer prng_state2.deinit();
+
+    // Allocate buffer in our address space
+    var buf1: [32]u8 = undefined;
+    var buf2: [32]u8 = undefined;
+
+    // Create notification pointing to our buffer
+    const notif1 = linux.SeccompNotif{
+        .id = 1,
+        .pid = 1,
+        .flags = 0,
+        .data = .{
+            .nr = linux.SYS.getrandom,
+            .arch = linux.auditArch(),
+            .instruction_pointer = 0,
+            .args = .{ @intFromPtr(&buf1), 32, 0, 0, 0, 0 },
+        },
+    };
+
+    const notif2 = linux.SeccompNotif{
+        .id = 2,
+        .pid = 1,
+        .flags = 0,
+        .data = .{
+            .nr = linux.SYS.getrandom,
+            .arch = linux.auditArch(),
+            .instruction_pointer = 0,
+            .args = .{ @intFromPtr(&buf2), 32, 0, 0, 0, 0 },
+        },
+    };
+
+    var ctx1 = HandlerContext{
+        .allocator = allocator,
+        .seccomp_fd = -1,
+        .prng_state = &prng_state1,
+    };
+
+    var ctx2 = HandlerContext{
+        .allocator = allocator,
+        .seccomp_fd = -1,
+        .prng_state = &prng_state2,
+    };
+
+    // Call handlers - they should write directly to buf1/buf2
+    const resp1 = handleGetrandom(&ctx1, &notif1);
+    const resp2 = handleGetrandom(&ctx2, &notif2);
+
+    // Both should succeed with 32 bytes
+    try std.testing.expectEqual(@as(i64, 32), resp1.val);
+    try std.testing.expectEqual(@as(i64, 32), resp2.val);
+    try std.testing.expectEqual(@as(u32, 0), resp1.flags); // Not CONTINUE
+    try std.testing.expectEqual(@as(u32, 0), resp2.flags);
+
+    // Buffers should be identical (same seed, same pid)
+    try std.testing.expectEqualSlices(u8, &buf1, &buf2);
+
+    // Buffers should not be all zeros (actually random)
+    var all_zero = true;
+    for (buf1) |b| {
+        if (b != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    try std.testing.expect(!all_zero);
+}
+
+test "clock_gettime handler writes to timespec buffer" {
+    var time_state = time_mod.DeterministicTime.initWithTime(1700000000);
+
+    // Allocate timespec in our address space
+    var ts: std.os.linux.timespec = undefined;
+
+    const notif = linux.SeccompNotif{
+        .id = 12345,
+        .pid = 1000,
+        .flags = 0,
+        .data = .{
+            .nr = linux.SYS.clock_gettime,
+            .arch = linux.auditArch(),
+            .instruction_pointer = 0,
+            .args = .{ 0, @intFromPtr(&ts), 0, 0, 0, 0 }, // CLOCK_REALTIME
+        },
+    };
+
+    var ctx = HandlerContext{
+        .allocator = std.testing.allocator,
+        .seccomp_fd = -1,
+        .time_state = &time_state,
+    };
+
+    const resp = handleClockGettime(&ctx, &notif);
+
+    // Should succeed
+    try std.testing.expectEqual(@as(i64, 0), resp.val);
+    try std.testing.expectEqual(@as(i32, 0), resp.@"error");
+    try std.testing.expectEqual(@as(u32, 0), resp.flags); // Not CONTINUE
+
+    // timespec should have the deterministic time
+    try std.testing.expectEqual(@as(isize, 1700000000), ts.sec);
+    try std.testing.expectEqual(@as(isize, 0), ts.nsec);
+}
+
+test "gettimeofday handler writes to timeval buffer" {
+    var time_state = time_mod.DeterministicTime.initWithTime(1700000000);
+
+    // Allocate timeval in our address space
+    var tv: std.os.linux.timeval = undefined;
+
+    const notif = linux.SeccompNotif{
+        .id = 12345,
+        .pid = 1000,
+        .flags = 0,
+        .data = .{
+            .nr = linux.SYS.gettimeofday,
+            .arch = linux.auditArch(),
+            .instruction_pointer = 0,
+            .args = .{ @intFromPtr(&tv), 0, 0, 0, 0, 0 },
+        },
+    };
+
+    var ctx = HandlerContext{
+        .allocator = std.testing.allocator,
+        .seccomp_fd = -1,
+        .time_state = &time_state,
+    };
+
+    const resp = handleGettimeofday(&ctx, &notif);
+
+    // Should succeed
+    try std.testing.expectEqual(@as(i64, 0), resp.val);
+    try std.testing.expectEqual(@as(i32, 0), resp.@"error");
+    try std.testing.expectEqual(@as(u32, 0), resp.flags); // Not CONTINUE
+
+    // timeval should have the deterministic time
+    try std.testing.expectEqual(@as(isize, 1700000000), tv.sec);
+    try std.testing.expectEqual(@as(isize, 0), tv.usec);
+}
+
+test "time syscall handler writes and returns time" {
+    var time_state = time_mod.DeterministicTime.initWithTime(1700000000);
+
+    // Allocate time_t in our address space
+    var t: i64 = undefined;
+
+    const notif = linux.SeccompNotif{
+        .id = 12345,
+        .pid = 1000,
+        .flags = 0,
+        .data = .{
+            .nr = linux.SYS.time,
+            .arch = linux.auditArch(),
+            .instruction_pointer = 0,
+            .args = .{ @intFromPtr(&t), 0, 0, 0, 0, 0 },
+        },
+    };
+
+    var ctx = HandlerContext{
+        .allocator = std.testing.allocator,
+        .seccomp_fd = -1,
+        .time_state = &time_state,
+    };
+
+    const resp = handleTimeSyscall(&ctx, &notif);
+
+    // Should return the time value
+    try std.testing.expectEqual(@as(i64, 1700000000), resp.val);
+    try std.testing.expectEqual(@as(i32, 0), resp.@"error");
+    try std.testing.expectEqual(@as(u32, 0), resp.flags); // Not CONTINUE
+
+    // t should also be written
+    try std.testing.expectEqual(@as(i64, 1700000000), t);
 }
