@@ -17,7 +17,7 @@ pub fn createWhiteout(path: []const u8) !void {
     const path_c = try std.heap.page_allocator.dupeZ(u8, path);
     defer std.heap.page_allocator.free(path_c);
 
-    const result = linux.mknod(path_c, linux.S.IFCHR | 0o000, dev);
+    const result = linux.mknod(path_c, linux.S.IFCHR | 0o000, @truncate(dev));
     if (result != 0) {
         return error.MknodFailed;
     }
