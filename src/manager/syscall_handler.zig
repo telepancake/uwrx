@@ -156,9 +156,16 @@ fn handleOpen(ctx: *HandlerContext, notif: *const linux.SeccompNotif) linux.Secc
             linux.SYS.open => notif.data.args[1],
             linux.SYS.creat => 0o100 | 0o1 | 0o1000, // O_CREAT | O_WRONLY | O_TRUNC
             linux.SYS.openat => notif.data.args[2],
-            linux.SYS.openat2 => {
-                // openat2 uses a struct - for now just continue the syscall
-                return seccomp.continueResponse(notif.id);
+            linux.SYS.openat2 => openat2_blk: {
+                // openat2 uses open_how struct: { flags: u64, mode: u64, resolve: u64 }
+                // Read flags field directly from the struct at args[2]
+                const how_ptr = notif.data.args[2];
+                if (how_ptr == 0) {
+                    return seccomp.errorResponse(notif.id, @intFromEnum(std.os.linux.E.FAULT));
+                }
+                // The first field is flags (u64)
+                const flags_ptr: *const u64 = @ptrFromInt(how_ptr);
+                break :openat2_blk flags_ptr.*;
             },
             else => 0,
         };
