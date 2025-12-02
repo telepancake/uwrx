@@ -17,7 +17,7 @@ uwrx/
 │   ├── supervisor/
 │   │   ├── mod.zig              # Supervisor module root
 │   │   ├── subreaper.zig        # Subreaper registration
-│   │   ├── tmpfs.zig            # tmpfs directory management
+│   │   ├── tempdir.zig          # temp directory management
 │   │   ├── lifecycle.zig        # Process lifecycle management
 │   │   └── collector.zig        # Trace buffer collection
 │   ├── manager/
@@ -127,7 +127,7 @@ uwrx/
       - `--tmp <path>` - Location where create temporary file directory, default under /tmp
       - `--source <dst>[:<priority>]=<source>` - Read-only source mapping (repeatable)
         - dst: destination path where source is mounted
-        - priority: ordering priority, default 100 (lower wins)
+        - priority: ordering priority, default 0 (higher wins)
         - source: host path (initial), or tar:/git:/oci:/squashfs: prefixed (future)
     - "test <test> [options]" - run a test case
     - "ui <path>" - examine a trace interactively
@@ -150,10 +150,10 @@ uwrx/
   - Maintain process tree state
   - check if all subprocesses have ended (some might have detached by double fork) before finishing active phase
 
-#### 2.2 tmpfs Management (`src/supervisor/tmpfs.zig`)
+#### 2.2 Temp Directory Management (`src/supervisor/tempdir.zig`)
 - **Tasks**:
   - Create unique temporary directory under /tmp or another location specified by "--tmp" option
-  - Create directory structure: `<tmpdir>/traces/`
+  - Create directory structure: `<tempdir>/traces/`
   - Implement cleanup on termination
 
 #### 2.3 Process Lifecycle (`src/supervisor/lifecycle.zig`)
@@ -161,9 +161,12 @@ uwrx/
   - Allocate deterministic pids (not OS pids):
     - Supervisor is pid 1
     - Spawned processes get 2, 3, 4, ... in spawn order
-    - fractional, versioned ids for unmatched processes during replay
-    - Maintain mapping: uwrx_pid <-> actual_os_pid <-> textual ordered pid
-    - mapping is saved to trace event
+    - Versioned pids for unmatched processes during replay:
+      - 3.1 - a new unmatched process launched before pid 4
+      - 3.1.2 - on next replay, second of two unmatched processes launched before pid 4
+      - Inside managed processes, normal sequential pid values are used, translated to version strings by supervisor
+    - Maintain mapping: host_pid <-> numeric_internal_pid <-> ordered_string_pid
+    - Pid mapping is recorded in trace event
     - On replay, processes get matching pids from trace (handles racy scheduling)
   - Track all supervised processes (uwrx_pid -> process info map)
   - Handle process creation notifications from manager threads
@@ -172,7 +175,7 @@ uwrx/
 
 #### 2.4 Trace Buffer Collection (`src/supervisor/collector.zig`)
 - **Tasks**:
-  - Periodically scan tmpfs trace directory
+  - Periodically scan temp trace directory
   - For each trace file:
     - Check if owning process still exists (`kill(pid, 0)`)
     - Read up to (file_size - 1MB) to avoid partial writes
@@ -302,9 +305,8 @@ uwrx/
     - `perfetto` - Compressed trace
     - `ca.pem` - CA certificate
     - `seed.txt` - PRNG seed (hex)
-    - `files.meta` - File modification metadata (process tracking)
-    - `sources` - Source specifications (dst, priority, type, spec per line)
-  - Manage `files/` directory with whiteouts
+    - `sources.txt` - Source specifications (dst, priority, type, spec per line)
+  - Manage `files/` and `files-<pid>/` directories with whiteouts
   - Manage `net/` directory structure
   - Handle `parent/` symlinks
   - Handle `replay` symlink
@@ -369,16 +371,15 @@ uwrx/
 
 #### 6.1 Overlay Filesystem (`src/filesystem/overlay.zig`)
 - **Tasks**:
-  - Build layered view from sources, parent traces, per-process versions, and bundled data
+  - Build layered view from bundled data, sources, parent traces, and per-process versions
   - For process P reading file X, resolution order:
-    1. Find all `files-<pid>/X` where `pid < P` (versions written before P ran)
-    2. Use the one with largest such pid
-    3. If none exist, use `files/X` (the original first version)
-    4. If not in `files/` at all, check parent traces' `files/` directories
-    5. Check sources (in priority order: lower priority number wins, longer dst wins on tie)
-    6. Check bundled data overlay (if uwrx has bundled executables)
+    1. Check bundled data overlay for currently running bundled executable (if uwrx launched a bundled executable)
+    2. Find all `files-<pid>/X` where `pid <= P` (versions written by P or before P ran)
+    3. Use the one with largest such pid
+    4. If none exist, use `files/X` (the original first version)
+    5. Check sources of this trace (in priority order: higher priority number wins, longer dst wins on tie, later trace layers override parents)
+    6. If not in files/ or sources, check parent traces' files-<pid>/, files/, and sources
     - Real filesystem is NOT directly accessible (isolation)
-  - Note: `files-<pid>/` not `files/<pid>/` to distinguish from normal paths like `/123/foo`
   - Pids are deterministic (allocated by uwrx), not actual OS pids
   - Handle whiteouts (deleted files) - same resolution logic applies
 
@@ -408,23 +409,20 @@ uwrx/
   - Replace actual timestamps with layer timestamps
   - Normalize permissions as needed
 
-#### 6.5 File Modification Metadata (`src/filesystem/meta.zig`)
+#### 6.5 File Modification Tracking (`src/filesystem/meta.zig`)
 - **Tasks**:
   - Track per-process file versions for correct partial rebuild
   - Problem: if A writes foo, B reads foo, C overwrites foo - need B's input version to determine if B can be skipped
   - Directory structure:
     - `files/<path>` - first written version (original)
     - `files-<pid>/<path>` - overwrites by process pid (only when file already existed)
-  - Note: `files-<pid>/` not `files/<pid>/` to distinguish from normal paths
   - On file write:
     - If file doesn't exist in `files/`: write to `files/<path>`
     - If file already exists in `files/`: write to `files-<pid>/<path>`
-  - Deduplication: use hardlinks or reflinks when file content is identical
+  - If file is deleted, a 0/0 char device whiteout is created (same as overlayfs)
   - Pids are deterministic (allocated by uwrx: 1=supervisor, 2, 3, 4... for spawned processes)
-  - No need to track pid for base `files/` - pid ordering determines visibility
-  - Maintain `files.meta` for inspection (not for resolution):
-    - `<relative_path>\t<pid>\t<operation>\t<exec_path>`
-  - Operations tracked: `create`, `write`, `delete`, `rename_to`, `rename_from`, `mkdir`, `rmdir`, `chmod`, `chown`
+  - No need to track pid for base `files/` - pid ordering determines visibility:
+    - If P's pid is smaller than all `files-<pid>/` containing the file, and P modified a file, that file is in base `files/`
   - Provide query interface:
     - `resolveFile(path, as_of_pid) -> ?FilePath` - which actual file would this pid see?
   - Essential for partial rebuild cache hit detection
@@ -435,20 +433,21 @@ uwrx/
   - Parse `--source <dst>[:<priority>]=<source>` command-line options
   - Source specification format:
     - dst: destination path where source is mounted
-    - priority: ordering priority, default 100 (lower number wins)
+    - priority: ordering priority, default 0 (higher number wins)
     - source: type-prefixed specification
   - Source types (extensible):
     - `host:` (or bare path) - Host directory (initial implementation)
-    - `tar:` - Tarball with optional `!/subpath` (future)
-    - `git:` - Git repository with optional `!treeish` (future)
-    - `oci:` - OCI image with optional `!/subpath` (future)
-    - `squashfs:` - Squashfs with optional `!/subpath` (future)
+    - `tar:` - Tarball with optional `:/subpath` (future)
+    - `git:` - Git repository with optional `:treeish` or `:treeish:subpath` (future)
+    - `oci:` - OCI image with optional `:/subpath` (future)
+    - `squashfs:` - Squashfs with optional `:/subpath` (future)
   - Source ordering for overlapping paths:
-    - Lower priority number wins
-    - If same priority, longer dst path wins (more specific mount)
+    - Higher priority number wins (priority 50 beats 0, 0 beats -50)
+    - If same priority, later trace layers win (parent is overridden by derived trace)
+    - If same priority and trace, longer dst path wins (more specific mount)
     - Sources layered, first match wins for file lookups
-  - Save source specifications to attempt's `sources` file
-  - On replay, validate sources available or allow remapping
+  - Save source specifications to attempt's `sources.txt` file
+  - On replay, sources must be available at same paths with same contents
   - Initial implementation: only `host.zig` for host directories
 
 ---
@@ -457,6 +456,7 @@ uwrx/
 
 #### 7.1 Hierarchical PRNG (`src/reproducibility/prng.zig`)
 - **Tasks**:
+  - Use PCG (Permuted Congruential Generator) due to its features (multiple streams) and simplicity
   - Generate root seed on fresh run, store in `seed.txt`
   - Load seed on replay
   - Implement hierarchical derivation:
@@ -500,7 +500,7 @@ uwrx/
   - On current run, before executing whitelisted process P:
     - For each file X that P read in replay trace:
       - Resolve which version P would see now using pid ordering:
-        - Find `files-<pid>/X` with largest `pid < P`, or `files/X` if none
+        - Find `files-<pid>/X` with largest `pid <= P`, or `files/X` if none
       - Compare content with what P saw in replay trace
     - If all input versions match: cache hit, can skip
     - If any input differs: must re-execute
@@ -526,7 +526,7 @@ uwrx/
 - **Tasks**:
   - Commands:
     - `uwrx inspect files <trace>` - List read/modified files
-    - `uwrx inspect files <trace> --who` - Show which process modified each file (uses files.meta)
+    - `uwrx inspect files <trace> --who` - Show which process modified each file (uses files-<pid>/ structure)
     - `uwrx inspect files <trace> --by-pid <pid>` - List files modified by specific process
     - `uwrx inspect procs <trace>` - List/tree processes
     - `uwrx inspect output <trace> [pid]` - Show stdout/stderr
@@ -553,20 +553,23 @@ uwrx/
 
 #### 10.1 Bundle Format (`src/bundle/format.zig`)
 - **Tasks**:
-  - Define ELF section format for bundled content:
-    - `.uwrx.execs` - bundled executables index and data
-    - `.uwrx.data` - compressed filesystem overlay (squashfs or similar)
+  - Define ELF section format for bundled content (multiple sections, one per bundled executable):
+    - `.uwrx.exec.<name>` - bundled executable code and data
+    - `.uwrx.data.<name>` - compressed filesystem overlay for that executable (squashfs or similar)
+  - Each bundled executable has its own pair of sections
   - Index format for executables:
-    - name -> (offset, size, entry_point_offset) mapping
+    - name -> (section name, offset, size, entry_point_offset) mapping
   - Parse bundled sections from own executable at startup
   - Handle case where sections don't exist (plain uwrx without bundles)
 
 #### 10.2 Bundled Executable Lookup (`src/bundle/lookup.zig`)
 - **Tasks**:
   - On startup, check argv[0] against bundled executable names
-  - If match: dispatch to run that executable under supervision
+  - If match via symlink: run executable without supervision (no traces, for normal tool usage)
+  - If invoked as `uwrx <command> [args]` without `--`: also run without supervision
+  - If invoked as `uwrx run -- <command>`: run with full supervision and tracing
   - Provide lookup function: `findBundled(name) -> ?BundledExec`
-  - BundledExec contains: code pointer, size, entry point offset
+  - BundledExec contains: code pointer, size, entry point offset, data section reference
 
 #### 10.3 Direct Execution (`src/bundle/execute.zig`)
 - **Tasks**:
@@ -583,9 +586,10 @@ uwrx/
 
 #### 10.4 Bundled Data Overlay (`src/bundle/data.zig`)
 - **Tasks**:
-  - Parse `.uwrx.data` section as compressed filesystem
+  - Parse `.uwrx.data.<name>` sections as compressed filesystems
+  - Each bundled executable has its own data section
   - Provide file lookup interface for overlay resolution
-  - Integrate with overlay filesystem as lowest-priority layer
+  - Integrate with overlay filesystem as highest-priority layer (checked first when that bundled executable is running)
   - Contains files bundled programs need:
     - /usr/include/* (headers)
     - /usr/lib/gcc/* (compiler support)
@@ -596,14 +600,15 @@ uwrx/
 - **Tasks**:
   - `uwrx bundle` command implementation:
     - `--output <path>` - output path for new bundled uwrx
-    - `--add <name>=<executable>` - add executable (repeatable)
-    - `--data <squashfs>` - add data overlay
+    - `--add <name>=<executable>` - add executable
+    - `--data <source>` - add data overlay for the executable
   - Process:
     - Copy own executable as base
-    - Validate executables are static and relocatable
-    - Append executables to `.uwrx.execs` section
-    - Append data overlay to `.uwrx.data` section
+    - Validate executable is static and relocatable
+    - Add executable to new `.uwrx.exec.<name>` section
+    - Add data overlay to new `.uwrx.data.<name>` section
     - Update ELF section headers
+  - Can be called multiple times to add more executables
   - Produce self-contained uwrx with complete toolchain
 
 ---
