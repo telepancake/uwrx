@@ -235,6 +235,68 @@ pub const c_self_exe =
     \\}
 ;
 
+/// Inline C program that tests getrandom syscall
+pub const c_getrandom =
+    \\#define _GNU_SOURCE
+    \\#include <stdio.h>
+    \\#include <sys/random.h>
+    \\int main() {
+    \\    unsigned char buf[16];
+    \\    ssize_t ret = getrandom(buf, sizeof(buf), 0);
+    \\    if (ret != sizeof(buf)) {
+    \\        printf("getrandom failed: %zd\n", ret);
+    \\        return 1;
+    \\    }
+    \\    printf("RANDOM:");
+    \\    for (int i = 0; i < 16; i++) {
+    \\        printf("%02x", buf[i]);
+    \\    }
+    \\    printf("\n");
+    \\    return 0;
+    \\}
+;
+
+/// Inline C program that tests clock_gettime syscall
+pub const c_clock_gettime =
+    \\#include <stdio.h>
+    \\#include <time.h>
+    \\int main() {
+    \\    struct timespec ts;
+    \\    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+    \\        printf("clock_gettime failed\n");
+    \\        return 1;
+    \\    }
+    \\    printf("TIME:%ld.%09ld\n", ts.tv_sec, ts.tv_nsec);
+    \\    return 0;
+    \\}
+;
+
+/// Inline C program that tests gettimeofday syscall
+pub const c_gettimeofday =
+    \\#include <stdio.h>
+    \\#include <sys/time.h>
+    \\int main() {
+    \\    struct timeval tv;
+    \\    if (gettimeofday(&tv, NULL) != 0) {
+    \\        printf("gettimeofday failed\n");
+    \\        return 1;
+    \\    }
+    \\    printf("TIME:%ld.%06ld\n", tv.tv_sec, tv.tv_usec);
+    \\    return 0;
+    \\}
+;
+
+/// Inline C program that tests time() syscall
+pub const c_time =
+    \\#include <stdio.h>
+    \\#include <time.h>
+    \\int main() {
+    \\    time_t t = time(NULL);
+    \\    printf("TIME:%ld\n", t);
+    \\    return 0;
+    \\}
+;
+
 test "createHelper" {
     const allocator = std.testing.allocator;
 
