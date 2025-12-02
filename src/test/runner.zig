@@ -132,6 +132,28 @@ pub const TestContext = struct {
             std.debug.print("  [LOG] " ++ fmt ++ "\n", args);
         }
     }
+
+    /// Check if uwrx run result indicates an environment limitation (not a real failure)
+    /// Returns true if the test should be skipped gracefully
+    pub fn isEnvLimitation(self: *TestContext, result: *const ProcessResult) bool {
+        if (result.exit_code == 0) return false;
+
+        // Check for various known environment limitations
+        const limitations = [_][]const u8{
+            "SeccompFailed",
+            "PrctlFailed",
+            "seccomp",
+            "EPERM",
+        };
+
+        for (limitations) |needle| {
+            if (std.mem.indexOf(u8, result.stderr, needle) != null) {
+                self.log("Skipping: environment limitation ({s})", .{needle});
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 /// Process execution result

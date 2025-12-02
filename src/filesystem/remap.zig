@@ -115,7 +115,7 @@ pub fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         if (component.len == 0 or std.mem.eql(u8, component, ".")) {
             continue;
         } else if (std.mem.eql(u8, component, "..")) {
-            _ = components.popOrNull();
+            _ = components.pop();
         } else {
             try components.append(component);
         }

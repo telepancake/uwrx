@@ -54,7 +54,8 @@ pub fn waitForChildren() WaitResult {
         var status: u32 = 0;
         const pid = std.os.linux.waitpid(-1, &status, std.os.linux.W.NOHANG);
 
-        if (pid > 0) {
+        // Check for error or no children (negative values as unsigned)
+        if (pid > 0 and pid < 0x8000_0000) {
             result.has_terminated = true;
             result.exit_status = status;
             result.terminated_pids.append(@intCast(pid)) catch {

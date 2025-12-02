@@ -111,6 +111,52 @@ pub const ExecutableInfo = struct {
     }
 };
 
+/// Result of detecting executable type
+pub const ExecutableType = union(enum) {
+    elf: void,
+    script: struct {
+        interpreter: []u8,
+        arg: ?[]u8,
+    },
+    unknown: void,
+};
+
+/// Detect if a file is an ELF or script
+pub fn detectExecutableType(allocator: std.mem.Allocator, path: []const u8) !ExecutableType {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return error.CannotOpen;
+    defer file.close();
+
+    var header: [256]u8 = undefined;
+    const bytes_read = file.readAll(&header) catch return error.CannotRead;
+    if (bytes_read < 4) return error.FileTooSmall;
+
+    // Check for ELF magic
+    if (std.mem.eql(u8, header[0..4], &ELF_MAGIC)) {
+        return .{ .elf = {} };
+    }
+
+    // Check for shebang
+    if (std.mem.eql(u8, header[0..2], "#!")) {
+        // Find end of first line
+        const line_end = std.mem.indexOf(u8, header[0..bytes_read], "\n") orelse bytes_read;
+        const shebang_line = header[2..line_end];
+
+        // Parse interpreter and optional arg
+        const trimmed = std.mem.trim(u8, shebang_line, " \t\r");
+        if (std.mem.indexOf(u8, trimmed, " ")) |space_idx| {
+            const interp = try allocator.dupe(u8, trimmed[0..space_idx]);
+            const arg_slice = std.mem.trim(u8, trimmed[space_idx + 1 ..], " \t");
+            const arg = if (arg_slice.len > 0) try allocator.dupe(u8, arg_slice) else null;
+            return .{ .script = .{ .interpreter = interp, .arg = arg } };
+        } else {
+            const interp = try allocator.dupe(u8, trimmed);
+            return .{ .script = .{ .interpreter = interp, .arg = null } };
+        }
+    }
+
+    return .{ .unknown = {} };
+}
+
 /// Load and parse an ELF executable
 pub fn loadExecutable(allocator: std.mem.Allocator, path: []const u8) !ExecutableInfo {
     const file = try std.fs.openFileAbsolute(path, .{});
@@ -126,6 +172,13 @@ pub fn loadExecutable(allocator: std.mem.Allocator, path: []const u8) !Executabl
 
     // Verify magic
     if (!std.mem.eql(u8, ehdr.e_ident[0..4], &ELF_MAGIC)) {
+        // Check for shebang - return special error so caller can handle
+        try file.seekTo(0);
+        var shebang_check: [2]u8 = undefined;
+        _ = file.readAll(&shebang_check) catch return error.InvalidElf;
+        if (std.mem.eql(u8, &shebang_check, "#!")) {
+            return error.IsScript;
+        }
         return error.InvalidElf;
     }
 
@@ -199,10 +252,11 @@ pub fn loadSegments(
         const aligned_vaddr = vaddr - page_offset;
         const aligned_memsz = std.mem.alignForward(u64, memsz + page_offset, page_size);
 
-        // Map memory
-        const prot: u32 = (if (phdr.p_flags & PF_R != 0) std.os.linux.PROT.READ else 0) |
-            (if (phdr.p_flags & PF_W != 0) std.os.linux.PROT.WRITE else 0) |
-            (if (phdr.p_flags & PF_X != 0) std.os.linux.PROT.EXEC else 0);
+        // Map memory - calculate protection flags
+        var prot: u32 = 0;
+        if (phdr.p_flags & PF_R != 0) prot |= std.os.linux.PROT.READ;
+        if (phdr.p_flags & PF_W != 0) prot |= std.os.linux.PROT.WRITE;
+        if (phdr.p_flags & PF_X != 0) prot |= std.os.linux.PROT.EXEC;
 
         const map_result = std.os.linux.mmap(
             @ptrFromInt(aligned_vaddr),
@@ -213,7 +267,7 @@ pub fn loadSegments(
             0,
         );
 
-        if (map_result == std.os.linux.MAP_FAILED) {
+        if (map_result == ~@as(usize, 0)) {
             return error.MmapFailed;
         }
 

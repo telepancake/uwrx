@@ -35,9 +35,11 @@ pub const OverlayState = struct {
     allocator: std.mem.Allocator,
     layers: std.ArrayList(Layer),
 
+    pub const SourceSpec = struct { dst: []const u8, priority: i32, source: []const u8 };
+
     pub fn init(
         allocator: std.mem.Allocator,
-        sources: []const struct { dst: []const u8, priority: i32, source: []const u8 },
+        sources: []const SourceSpec,
         parents: []const []const u8,
     ) !OverlayState {
         var layers = std.ArrayList(Layer).init(allocator);
@@ -218,12 +220,12 @@ pub const OverlayState = struct {
 test "OverlayState basic" {
     const allocator = std.testing.allocator;
 
-    const sources = [_]struct { dst: []const u8, priority: i32, source: []const u8 }{
+    const sources: []const OverlayState.SourceSpec = &.{
         .{ .dst = "/", .priority = 0, .source = "/tmp" },
     };
-    const parents = [_][]const u8{};
+    const parents: []const []const u8 = &.{};
 
-    var overlay_state = try OverlayState.init(allocator, &sources, &parents);
+    var overlay_state = try OverlayState.init(allocator, sources, parents);
     defer overlay_state.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), overlay_state.layers.items.len);

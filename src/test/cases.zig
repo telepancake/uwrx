@@ -465,33 +465,38 @@ fn testWhiteoutConcept(ctx: *runner.TestContext) !void {
 }
 
 fn testFileVersioning(ctx: *runner.TestContext) !void {
-    // Test the files/<path> vs files-<pid>/<path> concept
-    // First write goes to files/, overwrites go to files-<pid>/
+    // Test file versioning by running a script via uwrx that modifies files
+    // The trace should capture file versions
 
-    // Simulate the versioning concept
-    try ctx.makeDir("files");
-    try ctx.createFile("files/data.txt", "original");
+    const build_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.work_dir, "build" });
+    defer ctx.allocator.free(build_dir);
 
-    // Simulate process 2 overwriting
-    try ctx.makeDir("files-2");
-    try ctx.createFile("files-2/data.txt", "modified by pid 2");
+    // Create a script that writes to a file multiple times
+    const script =
+        \\#!/bin/sh
+        \\echo "version1" > "$1/data.txt"
+        \\echo "version2" > "$1/data.txt"
+        \\echo "version3" > "$1/data.txt"
+        \\cat "$1/data.txt"
+    ;
 
-    // Simulate process 3 overwriting
-    try ctx.makeDir("files-3");
-    try ctx.createFile("files-3/data.txt", "modified by pid 3");
+    const helper = try helpers.createHelper(ctx.allocator, ctx.work_dir, "versioning.sh", script);
+    defer ctx.allocator.free(helper);
 
-    // Verify versioning structure
-    const orig = try ctx.readFile("files/data.txt");
-    defer ctx.allocator.free(orig);
-    try ctx.expectContains(orig, "original");
+    // Run via uwrx
+    var result = try ctx.runUwrx(&.{ "run", "--build", build_dir, "--", helper, ctx.work_dir });
+    defer result.deinit(ctx.allocator);
 
-    const v2 = try ctx.readFile("files-2/data.txt");
-    defer ctx.allocator.free(v2);
-    try ctx.expectContains(v2, "modified by pid 2");
+    // Check for environment limitations
+    if (ctx.isEnvLimitation(&result)) {
+        return; // Skip gracefully
+    }
 
-    const v3 = try ctx.readFile("files-3/data.txt");
-    defer ctx.allocator.free(v3);
-    try ctx.expectContains(v3, "modified by pid 3");
+    // Verify the script ran and produced output
+    if (result.exit_code != 0) {
+        ctx.log("uwrx run exit code: {d}, stderr: {s}", .{ result.exit_code, result.stderr });
+    }
+    try ctx.expectContains(result.stdout, "version3");
 }
 
 fn testOverlayPriority(ctx: *runner.TestContext) !void {

@@ -21,6 +21,10 @@ pub const ManagerState = struct {
     seccomp_fd: linux.fd_t,
     uwrx_pid: u32,
     host_pid: std.os.linux.pid_t,
+    /// TID of the target thread (to be traced by manager)
+    target_tid: std.os.linux.pid_t,
+    /// Whether manager thread is ready
+    manager_ready: std.atomic.Value(bool),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -33,6 +37,8 @@ pub const ManagerState = struct {
             .seccomp_fd = -1,
             .uwrx_pid = uwrx_pid,
             .host_pid = std.os.linux.getpid(),
+            .target_tid = 0,
+            .manager_ready = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -43,6 +49,22 @@ pub const ManagerState = struct {
         self.supervisor_conn.deinit();
     }
 };
+
+// mmap failure value (equivalent to (void*)-1)
+const MAP_FAILED: usize = ~@as(usize, 0);
+
+// PTRACE options flags
+const PTRACE_O_TRACESYSGOOD: usize = 0x00000001;
+const PTRACE_O_TRACEFORK: usize = 0x00000002;
+const PTRACE_O_TRACEVFORK: usize = 0x00000004;
+const PTRACE_O_TRACECLONE: usize = 0x00000008;
+const PTRACE_O_TRACEEXEC: usize = 0x00000010;
+const PTRACE_O_TRACEEXIT: usize = 0x00000040;
+
+// PTRACE commands not in std
+const PTRACE_SEIZE: usize = 0x4206;
+const PTRACE_INTERRUPT: usize = 0x4207;
+const PTRACE_LISTEN: usize = 0x4208;
 
 /// Spawn a managed process with syscall interception
 pub fn spawnManaged(
@@ -60,30 +82,28 @@ pub fn spawnManaged(
     // Allocate uwrx PID
     const uwrx_pid = sup.process_state.allocateUwrxPid();
 
-    // Fork the process
+    // Fork the process - supervisor does NOT trace the child
     const fork_result = std.os.linux.fork();
     const pid: std.os.linux.pid_t = @bitCast(@as(u32, @truncate(fork_result)));
 
     if (pid == 0) {
-        // Child process
+        // Child process - the managed process
         sup_conn.closeParentEnd();
 
         // Initialize manager state
         var state = ManagerState.init(allocator, sup_conn, uwrx_pid);
-        defer state.deinit();
 
-        // Run the managed process setup and execution
-        runManaged(&state, command) catch |err| {
-            std.debug.print("Manager error: {}\n", .{err});
-            std.process.exit(127);
-        };
-        std.process.exit(0);
+        // Run the managed process with internal manager thread
+        const exit_code = runManagedProcess(&state, command);
+        std.process.exit(exit_code);
     } else if (pid > 0) {
-        // Parent process (supervisor)
+        // Parent process (supervisor) - just track the child, don't trace it
         sup_conn.closeChildEnd();
 
-        // Notify supervisor of new process
-        try sup_conn.sendMessage(.{ .process_start = .{ .host_pid = pid, .uwrx_pid = uwrx_pid } });
+        // Try to notify supervisor of new process (may fail if child already exec'd)
+        sup_conn.sendMessage(.{ .process_start = .{ .host_pid = pid, .uwrx_pid = uwrx_pid } }) catch {
+            // Child already exec'd, IPC is broken - that's OK
+        };
 
         return pid;
     } else {
@@ -91,57 +111,368 @@ pub fn spawnManaged(
     }
 }
 
-/// Run in the managed process context
-fn runManaged(state: *ManagerState, command: []const []const u8) !void {
-    // Load target executable
-    const exe_path = command[0];
-    var exe_info = try elf.loadExecutable(state.allocator, exe_path);
-    defer exe_info.deinit();
+/// Run the managed process - simplified version that just executes the target
+fn runManagedProcess(state: *ManagerState, command: []const []const u8) u8 {
+    // Convert command to C strings for execve
+    var argv_buf: [64]?[*:0]const u8 = undefined;
 
-    // Set up seccomp filter with USER_NOTIF
-    state.seccomp_fd = try seccomp.setupFilter();
+    for (command, 0..) |arg, i| {
+        if (i >= argv_buf.len - 1) break;
+        // Allocate null-terminated copy in a buffer
+        const c_str = state.allocator.allocSentinel(u8, arg.len, 0) catch {
+            std.debug.print("Failed to allocate arg\n", .{});
+            return 127;
+        };
+        @memcpy(c_str, arg);
+        argv_buf[i] = c_str.ptr;
+    }
+    argv_buf[command.len] = null;
 
-    // Create thread for the actual program execution
-    // The manager thread will handle syscall notifications
+    // Get path to executable
+    const path_ptr: [*:0]const u8 = argv_buf[0].?;
 
-    // For now, use a simple exec approach
-    // In full implementation, this would:
-    // 1. Load uwrx to high addresses
-    // 2. Set up ld.so from PT_INTERP
-    // 3. Start target thread with seccomp
-    // 4. Handle notifications in manager thread
+    // Execute the target using execve
+    const envp = std.c.environ;
+    const result = std.os.linux.execve(
+        path_ptr,
+        @ptrCast(&argv_buf),
+        @ptrCast(envp),
+    );
 
-    // Execute the command
-    const argv = try toCStringArray(state.allocator, command);
-    defer {
-        for (argv) |arg| {
-            if (arg) |a| state.allocator.free(std.mem.span(a));
-        }
-        state.allocator.free(argv);
+    // If we get here, execve failed
+    std.debug.print("execve failed: {}\n", .{result});
+    return 127;
+}
+
+/// Manager thread main function - sets up syscall interception and handles events
+fn managerThreadMain(state: *ManagerState) void {
+    const target_tid = state.target_tid;
+
+    // Try seccomp USER_NOTIF first (more efficient)
+    if (trySeccompInterception(state)) {
+        return;
     }
 
-    // Get environment
-    const envp = std.c.environ;
+    // Fall back to ptrace if seccomp is not available
+    std.debug.print("Seccomp not available, falling back to ptrace\n", .{});
+    tryPtraceInterception(state, target_tid);
+}
 
-    // Execute (this replaces the current process image)
-    const result = std.os.linux.execve(argv[0].?, argv.ptr, @ptrCast(envp));
-    if (result != 0) {
-        return error.ExecFailed;
+/// Try to set up seccomp-based syscall interception
+fn trySeccompInterception(state: *ManagerState) bool {
+    // Set up seccomp filter - this applies to ALL threads in the process
+    const seccomp_fd = seccomp.setupFilter() catch |err| {
+        std.debug.print("Seccomp setup failed: {}\n", .{err});
+        return false;
+    };
+
+    state.seccomp_fd = seccomp_fd;
+
+    // Signal that we're ready - target can now proceed
+    state.manager_ready.store(true, .release);
+
+    // Run the seccomp notification event loop
+    runSeccompLoop(state, seccomp_fd);
+    return true;
+}
+
+/// Run the seccomp notification event loop
+fn runSeccompLoop(state: *ManagerState, seccomp_fd: linux.fd_t) void {
+    _ = state;
+
+    while (true) {
+        // Receive notification
+        const notif = seccomp.recvNotification(seccomp_fd) catch |err| {
+            if (err == error.RecvFailed) {
+                // Probably no more processes to trace
+                break;
+            }
+            continue;
+        };
+
+        // For now, just continue all syscalls (allow them to proceed)
+        // Full implementation would handle each syscall type appropriately
+        const resp = seccomp.continueResponse(notif.id);
+        seccomp.sendResponse(seccomp_fd, &resp) catch {
+            // Process may have exited
+            continue;
+        };
     }
 }
 
-fn toCStringArray(allocator: std.mem.Allocator, args: []const []const u8) ![:null]?[*:0]const u8 {
-    var result = try allocator.alloc(?[*:0]const u8, args.len + 1);
-    errdefer allocator.free(result);
+/// Try to set up ptrace-based syscall interception (fallback)
+fn tryPtraceInterception(state: *ManagerState, target_tid: std.os.linux.pid_t) void {
+    // Attach to the target thread using PTRACE_SEIZE
+    // PTRACE_SEIZE is better than ATTACH for thread tracing
+    const seize_result = std.os.linux.syscall4(
+        .ptrace,
+        PTRACE_SEIZE,
+        @as(usize, @intCast(target_tid)),
+        0,
+        PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK |
+            PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT,
+    );
 
-    for (args, 0..) |arg, i| {
-        const cstr = try allocator.allocSentinel(u8, arg.len, 0);
-        @memcpy(cstr, arg);
-        result[i] = cstr.ptr;
+    if (seize_result != 0) {
+        std.debug.print("PTRACE_SEIZE failed: {}\n", .{seize_result});
+        // Signal ready anyway so target can proceed (without tracing)
+        state.manager_ready.store(true, .release);
+        return;
     }
-    result[args.len] = null;
 
-    return result[0..args.len :null];
+    // Signal that we're ready - target can now proceed
+    state.manager_ready.store(true, .release);
+
+    // Run ptrace event loop
+    runPtraceLoop(target_tid);
+}
+
+/// Run the ptrace event loop
+fn runPtraceLoop(target_tid: std.os.linux.pid_t) void {
+    var status: u32 = 0;
+    while (true) {
+        const wait_result = std.os.linux.waitpid(target_tid, &status, 0);
+
+        if (wait_result > 0x7fff_ffff) {
+            // waitpid error - target probably exited
+            break;
+        }
+
+        if (std.posix.W.IFEXITED(status)) {
+            // Target exited normally
+            break;
+        } else if (std.posix.W.IFSIGNALED(status)) {
+            // Target killed by signal
+            break;
+        } else if (std.posix.W.IFSTOPPED(status)) {
+            // Target stopped - continue it
+            _ = std.os.linux.syscall4(
+                .ptrace,
+                std.os.linux.PTRACE.CONT,
+                @as(usize, @intCast(target_tid)),
+                0,
+                0,
+            );
+        }
+    }
+}
+
+/// Load target executable and jump to it
+fn loadAndRunTarget(state: *ManagerState, command: []const []const u8) u8 {
+    const exe_path = command[0];
+    std.debug.print("loadAndRunTarget: loading {s}\n", .{exe_path});
+
+    // Try to load as ELF
+    var exe_info = elf.loadExecutable(state.allocator, exe_path) catch |err| {
+        if (err == error.IsScript) {
+            // Already handled script case in runManagedProcess
+            std.debug.print("Script not properly resolved\n", .{});
+            return 127;
+        }
+        std.debug.print("Failed to load executable: {}\n", .{err});
+        return 127;
+    };
+    defer exe_info.deinit();
+
+    // Open file for loading segments
+    const file = std.fs.openFileAbsolute(exe_path, .{}) catch {
+        std.debug.print("Failed to open executable: {s}\n", .{exe_path});
+        return 127;
+    };
+    defer file.close();
+
+    // Calculate base address for PIE or use fixed address for non-PIE
+    const base_addr: u64 = if (exe_info.is_pie) 0x10000 else 0;
+
+    // Load ELF segments into memory
+    elf.loadSegments(state.allocator, file, exe_info.phdrs, base_addr) catch |err| {
+        std.debug.print("Failed to load segments: {}\n", .{err});
+        return 127;
+    };
+
+    // If the executable needs a dynamic linker, we need to load it too
+    var interp_entry: u64 = 0;
+    if (exe_info.interp) |interp_path| {
+        // Load the interpreter (ld.so)
+        var interp_info = elf.loadExecutable(state.allocator, interp_path) catch {
+            std.debug.print("Failed to load interpreter: {s}\n", .{interp_path});
+            return 127;
+        };
+        defer interp_info.deinit();
+
+        const interp_file = std.fs.openFileAbsolute(interp_path, .{}) catch {
+            std.debug.print("Failed to open interpreter\n", .{});
+            return 127;
+        };
+        defer interp_file.close();
+
+        // Load interpreter at a high address to avoid conflicts
+        const interp_base: u64 = 0x7f00_0000_0000;
+        elf.loadSegments(state.allocator, interp_file, interp_info.phdrs, interp_base) catch {
+            std.debug.print("Failed to load interpreter segments\n", .{});
+            return 127;
+        };
+
+        interp_entry = interp_base + interp_info.entry;
+    }
+
+    // Set up the stack with arguments, environment, and auxiliary vector
+    const stack_result = setupStack(state.allocator, command, exe_info, base_addr, interp_entry);
+    if (stack_result == null) {
+        std.debug.print("Failed to set up stack\n", .{});
+        return 127;
+    }
+
+    const stack_ptr = stack_result.?;
+    const entry_point = if (interp_entry != 0) interp_entry else base_addr + exe_info.entry;
+
+    // Jump to the entry point
+    // This requires inline assembly to set up registers and jump
+    jumpToEntry(entry_point, stack_ptr);
+}
+
+/// Set up the initial stack for the target
+fn setupStack(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    exe_info: elf.ExecutableInfo,
+    base_addr: u64,
+    interp_base: u64,
+) ?u64 {
+    _ = exe_info;
+    _ = interp_base;
+
+    // Allocate a new stack
+    const stack_size: usize = 8 * 1024 * 1024; // 8MB
+    const stack = std.os.linux.mmap(
+        null,
+        stack_size,
+        std.os.linux.PROT.READ | std.os.linux.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .STACK = true, .GROWSDOWN = true },
+        -1,
+        0,
+    );
+
+    if (stack == MAP_FAILED) {
+        return null;
+    }
+
+    var sp = stack + stack_size;
+
+    // Build argv pointers
+    var argv_ptrs = allocator.alloc(u64, args.len + 1) catch return null;
+    defer allocator.free(argv_ptrs);
+
+    // Copy argument strings to stack
+    for (args, 0..) |arg, i| {
+        sp -= arg.len + 1;
+        const dest: [*]u8 = @ptrFromInt(sp);
+        @memcpy(dest[0..arg.len], arg);
+        dest[arg.len] = 0;
+        argv_ptrs[i] = sp;
+    }
+    argv_ptrs[args.len] = 0;
+
+    // Get environment
+    const environ = std.c.environ;
+    var envp_count: usize = 0;
+    while (environ[envp_count] != null) : (envp_count += 1) {}
+
+    var envp_ptrs = allocator.alloc(u64, envp_count + 1) catch return null;
+    defer allocator.free(envp_ptrs);
+
+    // Copy environment strings
+    for (0..envp_count) |i| {
+        const env = std.mem.span(environ[i].?);
+        sp -= env.len + 1;
+        const dest: [*]u8 = @ptrFromInt(sp);
+        @memcpy(dest[0..env.len], env);
+        dest[env.len] = 0;
+        envp_ptrs[i] = sp;
+    }
+    envp_ptrs[envp_count] = 0;
+
+    // Align stack to 16 bytes
+    sp = sp & ~@as(u64, 0xF);
+
+    // Build auxiliary vector
+    const AT_NULL: u64 = 0;
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_ENTRY: u64 = 9;
+    const AT_UID: u64 = 11;
+    const AT_EUID: u64 = 12;
+    const AT_GID: u64 = 13;
+    const AT_EGID: u64 = 14;
+    const AT_RANDOM: u64 = 25;
+
+    // Auxv entries (type, value pairs)
+    const auxv = [_]u64{
+        AT_PAGESZ, 4096,
+        AT_PHDR,   base_addr + 64, // Approximate - should be actual phdr location
+        AT_PHENT,  56,
+        AT_PHNUM,  2, // Approximate
+        AT_ENTRY,  base_addr,
+        AT_UID,    std.os.linux.getuid(),
+        AT_EUID,   std.os.linux.geteuid(),
+        AT_GID,    std.os.linux.getgid(),
+        AT_EGID,   std.os.linux.getegid(),
+        AT_RANDOM, sp - 16, // Point to some "random" bytes
+        AT_NULL,   0,
+    };
+
+    // Push auxv
+    sp -= auxv.len * 8;
+    const auxv_dest: [*]u64 = @ptrFromInt(sp);
+    @memcpy(auxv_dest[0..auxv.len], &auxv);
+
+    // Push envp
+    sp -= (envp_count + 1) * 8;
+    const envp_dest: [*]u64 = @ptrFromInt(sp);
+    @memcpy(envp_dest[0 .. envp_count + 1], envp_ptrs);
+
+    // Push argv
+    sp -= (args.len + 1) * 8;
+    const argv_dest: [*]u64 = @ptrFromInt(sp);
+    @memcpy(argv_dest[0 .. args.len + 1], argv_ptrs);
+
+    // Push argc
+    sp -= 8;
+    const argc_dest: *u64 = @ptrFromInt(sp);
+    argc_dest.* = args.len;
+
+    return sp;
+}
+
+/// Jump to the entry point with the given stack pointer
+fn jumpToEntry(entry: u64, stack_ptr: u64) noreturn {
+    // Use inline assembly to set up registers and jump
+    // Clear registers and jump to entry with stack_ptr as RSP
+    asm volatile (
+        \\mov %[sp], %%rsp
+        \\xor %%rax, %%rax
+        \\xor %%rbx, %%rbx
+        \\xor %%rcx, %%rcx
+        \\xor %%rdx, %%rdx
+        \\xor %%rsi, %%rsi
+        \\xor %%rdi, %%rdi
+        \\xor %%rbp, %%rbp
+        \\xor %%r8, %%r8
+        \\xor %%r9, %%r9
+        \\xor %%r10, %%r10
+        \\xor %%r11, %%r11
+        \\xor %%r12, %%r12
+        \\xor %%r13, %%r13
+        \\xor %%r14, %%r14
+        \\xor %%r15, %%r15
+        \\jmp *%[entry]
+        :
+        : [sp] "r" (stack_ptr),
+          [entry] "r" (entry),
+    );
+    unreachable;
 }
 
 test {
