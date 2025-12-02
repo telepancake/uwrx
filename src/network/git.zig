@@ -55,22 +55,27 @@ pub fn isGitRequest(path: []const u8, method: []const u8) bool {
 
 /// Extract repository path from URL
 pub fn extractRepoPath(path: []const u8) ?[]const u8 {
-    // Remove known suffixes
+    // Remove known suffixes - apply all that match (not just first)
     var repo_path = path;
 
-    const suffixes = [_][]const u8{
+    // First remove protocol-specific suffixes
+    const protocol_suffixes = [_][]const u8{
         "/info/refs",
         "/git-upload-pack",
         "/git-receive-pack",
         "/HEAD",
-        ".git",
     };
 
-    for (suffixes) |suffix| {
+    for (protocol_suffixes) |suffix| {
         if (std.mem.endsWith(u8, repo_path, suffix)) {
             repo_path = repo_path[0 .. repo_path.len - suffix.len];
             break;
         }
+    }
+
+    // Then remove .git suffix if present
+    if (std.mem.endsWith(u8, repo_path, ".git")) {
+        repo_path = repo_path[0 .. repo_path.len - 4];
     }
 
     // Find /objects/ or /refs/ and truncate

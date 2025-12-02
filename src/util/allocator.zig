@@ -37,7 +37,7 @@ pub const MmapArena = struct {
             0,
         );
 
-        if (mmap_result == std.os.linux.MAP_FAILED) {
+        if (mmap_result == ~@as(usize, 0)) {
             return error.MmapFailed;
         }
 
@@ -159,7 +159,7 @@ pub fn allocPages(num_pages: usize) ![]align(4096) u8 {
         0,
     );
 
-    if (result == std.os.linux.MAP_FAILED) {
+    if (result == ~@as(usize, 0)) {
         return error.MmapFailed;
     }
 

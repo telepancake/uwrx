@@ -48,7 +48,7 @@ pub const TraceBuffer = struct {
             },
             0o644,
         );
-        errdefer std.os.linux.close(fd);
+        errdefer _ = std.os.linux.close(fd);
 
         // Extend file to initial size
         try std.posix.ftruncate(fd, BUFFER_SIZE);
@@ -63,7 +63,7 @@ pub const TraceBuffer = struct {
             0,
         );
 
-        if (map_result == std.os.linux.MAP_FAILED) {
+        if (map_result == ~@as(usize, 0)) {
             return error.MmapFailed;
         }
 
@@ -83,7 +83,7 @@ pub const TraceBuffer = struct {
         if (self.map_base) |base| {
             _ = std.os.linux.munmap(base, self.map_size);
         }
-        std.os.linux.close(self.fd);
+        _ = std.os.linux.close(self.fd);
         self.allocator.free(self.path);
     }
 
@@ -138,7 +138,7 @@ pub const TraceBuffer = struct {
             @intCast(self.map_offset),
         );
 
-        if (map_result == std.os.linux.MAP_FAILED) {
+        if (map_result == ~@as(usize, 0)) {
             self.map_base = null;
             return error.MmapFailed;
         }

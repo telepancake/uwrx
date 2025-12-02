@@ -31,18 +31,23 @@ pub const LoopbackState = struct {
     }
 
     pub fn deinit(self: *LoopbackState) void {
-        var it = self.ipv4_map.valueIterator();
-        while (it.next()) |ip| {
-            self.allocator.free(ip.*);
+        // Free IPv4 map keys and values
+        var it = self.ipv4_map.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(@constCast(entry.key_ptr.*));
         }
         self.ipv4_map.deinit();
 
-        var it6 = self.ipv6_map.valueIterator();
-        while (it6.next()) |ip| {
-            self.allocator.free(ip.*);
+        // Free IPv6 map keys and values
+        var it6 = self.ipv6_map.iterator();
+        while (it6.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(@constCast(entry.key_ptr.*));
         }
         self.ipv6_map.deinit();
 
+        // reverse_map values point to same domains as ipv4/ipv6 maps, so don't double free
         self.reverse_map.deinit();
     }
 

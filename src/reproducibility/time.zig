@@ -82,8 +82,8 @@ pub const DeterministicTime = struct {
                 const base_ns = self.base_time * std.time.ns_per_s;
                 const result_ns = base_ns + (now - start_ns);
                 break :blk .{
-                    .sec = @divFloor(result_ns, std.time.ns_per_s),
-                    .nsec = @mod(result_ns, std.time.ns_per_s),
+                    .sec = @intCast(@divFloor(result_ns, std.time.ns_per_s)),
+                    .nsec = @intCast(@mod(result_ns, std.time.ns_per_s)),
                 };
             },
         };

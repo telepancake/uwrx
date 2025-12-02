@@ -185,7 +185,7 @@ pub const HttpRequest = struct {
 
 test "HTTP request parsing" {
     const request = "GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
-    const parsed = try HttpRequest.parse(request);
+    var parsed = try HttpRequest.parse(request);
     defer parsed.headers.deinit();
 
     try std.testing.expectEqualStrings("GET", parsed.method);

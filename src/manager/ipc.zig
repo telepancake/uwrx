@@ -193,5 +193,5 @@ pub const SupervisorConnection = struct {
 
 test "message serialization" {
     const msg = Message{ .process_start = .{ .host_pid = 1234, .uwrx_pid = 2 } };
-    try std.testing.expectEqual(MessageType.process_start, msg);
+    try std.testing.expectEqual(MessageType.process_start, std.meta.activeTag(msg));
 }

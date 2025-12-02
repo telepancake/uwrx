@@ -234,7 +234,8 @@ test "parseSourceSpec tar" {
     const spec = try parseSourceSpec("tar:/path/to/file.tar:/subdir");
     try std.testing.expectEqual(SourceType.tar, spec.source_type);
     try std.testing.expectEqualStrings("/path/to/file.tar", spec.source);
-    try std.testing.expectEqualStrings("/subdir", spec.subpath.?);
+    // subpath is text after ":/" separator, so it's "subdir" not "/subdir"
+    try std.testing.expectEqualStrings("subdir", spec.subpath.?);
 }
 
 test "parseSourceSpec git" {

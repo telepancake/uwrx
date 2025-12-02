@@ -75,7 +75,7 @@ fn findHighAddress(size: u64) !u64 {
             0,
         );
 
-        if (result != std.os.linux.MAP_FAILED) {
+        if (result != ~@as(usize, 0)) {
             // Found free space, unmap and return
             _ = std.os.linux.munmap(@ptrFromInt(result), aligned_size);
 
