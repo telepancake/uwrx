@@ -46,7 +46,16 @@ uwrx/
 │   │   ├── overlay.zig          # Layered filesystem view
 │   │   ├── remap.zig            # Path remapping
 │   │   ├── whiteout.zig         # Whiteout (deletion) handling
-│   │   └── timestamp.zig        # Timestamp/permission squashing
+│   │   ├── timestamp.zig        # Timestamp/permission squashing
+│   │   └── meta.zig             # File modification metadata tracking
+│   ├── sources/
+│   │   ├── mod.zig              # Sources module root
+│   │   ├── types.zig            # Source type definitions and parsing
+│   │   ├── host.zig             # Host directory source (initial impl)
+│   │   ├── tar.zig              # Tarball source (future)
+│   │   ├── git.zig              # Git repository source (future)
+│   │   ├── oci.zig              # OCI image source (future)
+│   │   └── squashfs.zig         # Squashfs source (future)
 │   ├── reproducibility/
 │   │   ├── mod.zig              # Reproducibility module root
 │   │   ├── prng.zig             # Hierarchical PRNG system
@@ -61,6 +70,13 @@ uwrx/
 │   │   ├── mod.zig              # Inspection module root
 │   │   ├── cli.zig              # CLI inspection commands
 │   │   └── tui.zig              # Interactive terminal UI
+│   ├── bundle/
+│   │   ├── mod.zig              # Bundle module root
+│   │   ├── format.zig           # Bundle section format and parsing
+│   │   ├── lookup.zig           # Bundled executable lookup
+│   │   ├── execute.zig          # Direct execution of bundled code
+│   │   ├── data.zig             # Bundled data overlay access
+│   │   └── create.zig           # Bundle creation tool
 │   ├── tests/
 │   │   ├── unit/                # Unit tests
 │   │   └── integration/         # Integration tests
@@ -109,8 +125,17 @@ uwrx/
       - `--replay <path>` - Trace to replay
       - `--net` / `--no-net` - Network mode. For replay default is off, otherwise default is on
       - `--tmp <path>` - Location where create temporary file directory, default under /tmp
+      - `--source <dst>[:<priority>]=<source>` - Read-only source mapping (repeatable)
+        - dst: destination path where source is mounted
+        - priority: ordering priority, default 100 (lower wins)
+        - source: host path (initial), or tar:/git:/oci:/squashfs: prefixed (future)
     - "test <test> [options]" - run a test case
     - "ui <path>" - examine a trace interactively
+    - "bundle [options]" - create bundled uwrx with executables and data
+      - `--output <path>` - output path for bundled uwrx
+      - `--add <name>=<executable>` - add executable to bundle (repeatable)
+      - `--data <squashfs>` - add data overlay (compressed filesystem)
+  - Symlink/hardlink dispatch: if argv[0] matches bundled executable name, run it
   - Initialize logging
   - Dispatch to appropriate module
 
@@ -133,7 +158,12 @@ uwrx/
 
 #### 2.3 Process Lifecycle (`src/supervisor/lifecycle.zig`)
 - **Tasks**:
-  - Track all supervised processes (pid -> process info map)
+  - Allocate deterministic pids (not OS pids):
+    - Supervisor is pid 1
+    - Spawned processes get 2, 3, 4, ... in spawn order
+    - Maintain mapping: uwrx_pid <-> actual_os_pid
+    - On replay, processes get matching pids from trace (handles racy scheduling)
+  - Track all supervised processes (uwrx_pid -> process info map)
   - Handle process creation notifications from manager threads
   - Handle process termination (collect final traces, clean up)
   - Implement graceful shutdown (SIGTERM to all children)
@@ -270,6 +300,8 @@ uwrx/
     - `perfetto` - Compressed trace
     - `ca.pem` - CA certificate
     - `seed.txt` - PRNG seed (hex)
+    - `files.meta` - File modification metadata (process tracking)
+    - `sources` - Source specifications (dst, priority, type, spec per line)
   - Manage `files/` directory with whiteouts
   - Manage `net/` directory structure
   - Handle `parent/` symlinks
@@ -335,13 +367,18 @@ uwrx/
 
 #### 6.1 Overlay Filesystem (`src/filesystem/overlay.zig`)
 - **Tasks**:
-  - Build layered view from parent traces
-  - Layers (bottom to top):
-    - Real filesystem (read-only base)
-    - Parent trace `files/` directories (in dependency order)
-    - Current attempt `files/` directory (read-write)
-  - Path resolution: Check each layer top-down
-  - Handle whiteouts (deleted files)
+  - Build layered view from sources, parent traces, per-process versions, and bundled data
+  - For process P reading file X, resolution order:
+    1. Find all `files-<pid>/X` where `pid < P` (versions written before P ran)
+    2. Use the one with largest such pid
+    3. If none exist, use `files/X` (the original first version)
+    4. If not in `files/` at all, check parent traces' `files/` directories
+    5. Check sources (in priority order: lower priority number wins, longer dst wins on tie)
+    6. Check bundled data overlay (if uwrx has bundled executables)
+    - Real filesystem is NOT directly accessible (isolation)
+  - Note: `files-<pid>/` not `files/<pid>/` to distinguish from normal paths like `/123/foo`
+  - Pids are deterministic (allocated by uwrx), not actual OS pids
+  - Handle whiteouts (deleted files) - same resolution logic applies
 
 #### 6.2 Path Remapping (`src/filesystem/remap.zig`)
 - **Tasks**:
@@ -368,6 +405,49 @@ uwrx/
   - Intercept stat() family syscalls
   - Replace actual timestamps with layer timestamps
   - Normalize permissions as needed
+
+#### 6.5 File Modification Metadata (`src/filesystem/meta.zig`)
+- **Tasks**:
+  - Track per-process file versions for correct partial rebuild
+  - Problem: if A writes foo, B reads foo, C overwrites foo - need B's input version to determine if B can be skipped
+  - Directory structure:
+    - `files/<path>` - first written version (original)
+    - `files-<pid>/<path>` - overwrites by process pid (only when file already existed)
+  - Note: `files-<pid>/` not `files/<pid>/` to distinguish from normal paths
+  - On file write:
+    - If file doesn't exist in `files/`: write to `files/<path>`
+    - If file already exists in `files/`: write to `files-<pid>/<path>`
+  - Deduplication: use hardlinks or reflinks when file content is identical
+  - Pids are deterministic (allocated by uwrx: 1=supervisor, 2, 3, 4... for spawned processes)
+  - No need to track pid for base `files/` - pid ordering determines visibility
+  - Maintain `files.meta` for inspection (not for resolution):
+    - `<relative_path>\t<pid>\t<operation>\t<exec_path>`
+  - Operations tracked: `create`, `write`, `delete`, `rename_to`, `rename_from`, `mkdir`, `rmdir`, `chmod`, `chown`
+  - Provide query interface:
+    - `resolveFile(path, as_of_pid) -> ?FilePath` - which actual file would this pid see?
+  - Essential for partial rebuild cache hit detection
+
+#### 6.6 Read-Only Sources (`src/sources/`)
+- **Tasks**:
+  - Provide input files as base layer of filesystem (without sources, filesystem is empty)
+  - Parse `--source <dst>[:<priority>]=<source>` command-line options
+  - Source specification format:
+    - dst: destination path where source is mounted
+    - priority: ordering priority, default 100 (lower number wins)
+    - source: type-prefixed specification
+  - Source types (extensible):
+    - `host:` (or bare path) - Host directory (initial implementation)
+    - `tar:` - Tarball with optional `!/subpath` (future)
+    - `git:` - Git repository with optional `!treeish` (future)
+    - `oci:` - OCI image with optional `!/subpath` (future)
+    - `squashfs:` - Squashfs with optional `!/subpath` (future)
+  - Source ordering for overlapping paths:
+    - Lower priority number wins
+    - If same priority, longer dst path wins (more specific mount)
+    - Sources layered, first match wins for file lookups
+  - Save source specifications to attempt's `sources` file
+  - On replay, validate sources available or allow remapping
+  - Initial implementation: only `host.zig` for host directories
 
 ---
 
@@ -413,12 +493,20 @@ uwrx/
 #### 8.2 Cache Hit Detection (`src/rebuild/cache.zig`)
 - **Tasks**:
   - For each process in replay trace:
-    - Collect all read and written file and directory paths
-    - See if no changes in layers above
-  - On current run:
-    - Before executing whitelisted process:
-    - Check if all read files and directories are unchanged
-    - Account for different parent trace sets
+    - Collect all read file paths
+    - Collect all written file paths
+  - On current run, before executing whitelisted process P:
+    - For each file X that P read in replay trace:
+      - Resolve which version P would see now using pid ordering:
+        - Find `files-<pid>/X` with largest `pid < P`, or `files/X` if none
+      - Compare content with what P saw in replay trace
+    - If all input versions match: cache hit, can skip
+    - If any input differs: must re-execute
+  - Per-process versioning via `files-<pid>/` directories is essential:
+    - Example: A writes foo, B reads foo, C overwrites foo
+    - B sees `files/foo` (original), C's version goes to `files-<C_pid>/foo`
+    - On replay, can verify B's input by checking `files/foo`
+  - Deterministic pids ensure same logical process gets same pid on replay
 
 #### 8.3 Process Skipping (`src/rebuild/skip.zig`)
 - **Tasks**:
@@ -436,6 +524,8 @@ uwrx/
 - **Tasks**:
   - Commands:
     - `uwrx inspect files <trace>` - List read/modified files
+    - `uwrx inspect files <trace> --who` - Show which process modified each file (uses files.meta)
+    - `uwrx inspect files <trace> --by-pid <pid>` - List files modified by specific process
     - `uwrx inspect procs <trace>` - List/tree processes
     - `uwrx inspect output <trace> [pid]` - Show stdout/stderr
     - `uwrx inspect events <trace>` - Raw event listing
@@ -454,6 +544,65 @@ uwrx/
     - stdout/stderr
   - Search functionality
   - Use Zig terminal library or raw escape sequences
+
+---
+
+### Phase 10: Bundled Executables
+
+#### 10.1 Bundle Format (`src/bundle/format.zig`)
+- **Tasks**:
+  - Define ELF section format for bundled content:
+    - `.uwrx.execs` - bundled executables index and data
+    - `.uwrx.data` - compressed filesystem overlay (squashfs or similar)
+  - Index format for executables:
+    - name -> (offset, size, entry_point_offset) mapping
+  - Parse bundled sections from own executable at startup
+  - Handle case where sections don't exist (plain uwrx without bundles)
+
+#### 10.2 Bundled Executable Lookup (`src/bundle/lookup.zig`)
+- **Tasks**:
+  - On startup, check argv[0] against bundled executable names
+  - If match: dispatch to run that executable under supervision
+  - Provide lookup function: `findBundled(name) -> ?BundledExec`
+  - BundledExec contains: code pointer, size, entry point offset
+
+#### 10.3 Direct Execution (`src/bundle/execute.zig`)
+- **Tasks**:
+  - When manager thread intercepts execve() for bundled executable:
+    - Skip filesystem load entirely
+    - Bundled code already in memory (part of uwrx in high addresses)
+    - Set up execution environment (stack, auxv, etc.)
+    - Transfer directly to bundled executable's entry point
+  - Requirements for bundled executables:
+    - Must be statically linked
+    - Must be position-independent (relocatable)
+    - Entry point must be relative to load address
+  - Significant performance win: no I/O, no memory allocation for code
+
+#### 10.4 Bundled Data Overlay (`src/bundle/data.zig`)
+- **Tasks**:
+  - Parse `.uwrx.data` section as compressed filesystem
+  - Provide file lookup interface for overlay resolution
+  - Integrate with overlay filesystem as lowest-priority layer
+  - Contains files bundled programs need:
+    - /usr/include/* (headers)
+    - /usr/lib/gcc/* (compiler support)
+    - /usr/lib/*.a (static libraries)
+    - etc.
+
+#### 10.5 Bundle Creation Tool (`src/bundle/create.zig`)
+- **Tasks**:
+  - `uwrx bundle` command implementation:
+    - `--output <path>` - output path for new bundled uwrx
+    - `--add <name>=<executable>` - add executable (repeatable)
+    - `--data <squashfs>` - add data overlay
+  - Process:
+    - Copy own executable as base
+    - Validate executables are static and relocatable
+    - Append executables to `.uwrx.execs` section
+    - Append data overlay to `.uwrx.data` section
+    - Update ELF section headers
+  - Produce self-contained uwrx with complete toolchain
 
 ---
 
@@ -478,11 +627,12 @@ uwrx/
 
 ### Milestone 3: File Interception
 1. File syscall interception
-2. Overlay filesystem (single layer)
-3. Path remapping
-4. Timestamp squashing
-5. Multi-layer overlay (parent traces)
-6. Whiteout handling
+2. Read-only sources (host directories only initially)
+3. Overlay filesystem (single layer)
+4. Path remapping
+5. Timestamp squashing
+6. Multi-layer overlay (parent traces)
+7. Whiteout handling
 
 ### Milestone 4: Tracing
 1. Perfetto format writer
@@ -519,6 +669,14 @@ uwrx/
 4. Documentation
 5. Comprehensive testing
 
+### Milestone 9: Bundled Executables
+1. Bundle format and section parsing
+2. Bundled executable lookup
+3. Direct execution of bundled code
+4. Bundled data overlay integration
+5. Bundle creation tool
+6. Symlink/hardlink invocation dispatch
+
 ---
 
 ## Key Technical Challenges
@@ -547,6 +705,13 @@ uwrx/
 - Multiple processes writing to tmpfs simultaneously
 - Supervisor reading while processes write
 - Use atomic operations and careful offset management
+
+### 6. Bundled Executable Requirements
+- Bundled executables must be statically linked and position-independent
+- May require recompiling toolchain with specific flags (-static -fPIC)
+- Entry point detection and relocation handling
+- ELF section manipulation for bundle creation
+- Compressed data overlay access without extraction to disk
 
 ---
 
