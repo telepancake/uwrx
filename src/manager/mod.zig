@@ -111,37 +111,90 @@ pub fn spawnManaged(
     }
 }
 
-/// Run the managed process - simplified version that just executes the target
+/// Thread context passed to manager thread
+const ManagerThreadContext = struct {
+    state: *ManagerState,
+    command: []const []const u8,
+};
+
+/// Stack size for manager thread
+const MANAGER_STACK_SIZE: usize = 64 * 1024; // 64KB
+
+/// Run the managed process with proper manager thread architecture
+///
+/// Architecture:
+/// 1. Create manager thread with clone(CLONE_VM | CLONE_THREAD)
+/// 2. Manager thread installs seccomp filter (ioctl NOT intercepted, so it can handle notifications)
+/// 3. Manager thread enters notification loop
+/// 4. Original thread waits for manager, then loads target via ELF loader (NO EXECVE)
+/// 5. Original thread jumps to loaded code - syscalls are now intercepted by manager
 fn runManagedProcess(state: *ManagerState, command: []const []const u8) u8 {
-    // Convert command to C strings for execve
-    var argv_buf: [64]?[*:0]const u8 = undefined;
-
-    for (command, 0..) |arg, i| {
-        if (i >= argv_buf.len - 1) break;
-        // Allocate null-terminated copy in a buffer
-        const c_str = state.allocator.allocSentinel(u8, arg.len, 0) catch {
-            std.debug.print("Failed to allocate arg\n", .{});
-            return 127;
-        };
-        @memcpy(c_str, arg);
-        argv_buf[i] = c_str.ptr;
-    }
-    argv_buf[command.len] = null;
-
-    // Get path to executable
-    const path_ptr: [*:0]const u8 = argv_buf[0].?;
-
-    // Execute the target using execve
-    const envp = std.c.environ;
-    const result = std.os.linux.execve(
-        path_ptr,
-        @ptrCast(&argv_buf),
-        @ptrCast(envp),
+    // Allocate stack for manager thread
+    const stack_result = std.os.linux.mmap(
+        null,
+        MANAGER_STACK_SIZE,
+        std.os.linux.PROT.READ | std.os.linux.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .STACK = true },
+        -1,
+        0,
     );
 
-    // If we get here, execve failed
-    std.debug.print("execve failed: {}\n", .{result});
-    return 127;
+    if (stack_result == MAP_FAILED) {
+        std.debug.print("Failed to allocate manager thread stack\n", .{});
+        return 127;
+    }
+
+    // Stack grows down, so start at the top
+    const stack_top = stack_result + MANAGER_STACK_SIZE;
+
+    // Prepare context for manager thread
+    var ctx = ManagerThreadContext{
+        .state = state,
+        .command = command,
+    };
+
+    // Store target TID for manager to track
+    state.target_tid = std.os.linux.gettid();
+
+    // Create manager thread with CLONE_VM | CLONE_THREAD
+    // CLONE_VM: share address space (so manager can write directly to target's memory)
+    // CLONE_THREAD: same thread group
+    // CLONE_SIGHAND: share signal handlers
+    // CLONE_FS: share filesystem info
+    // CLONE_FILES: share file descriptors
+    const clone_flags = linux.CLONE_VM | linux.CLONE_THREAD | linux.CLONE_SIGHAND |
+        linux.CLONE_FS | linux.CLONE_FILES;
+
+    const clone_result = std.os.linux.clone(
+        managerThreadEntry,
+        stack_top,
+        @intCast(clone_flags),
+        @intFromPtr(&ctx),
+        null,
+        0,
+        null,
+    );
+
+    if (clone_result == 0 or clone_result > 0x8000_0000_0000_0000) {
+        std.debug.print("Failed to create manager thread\n", .{});
+        return 127;
+    }
+
+    // Wait for manager thread to be ready
+    while (!state.manager_ready.load(.acquire)) {
+        // Spin wait - manager thread will set this after installing seccomp
+        std.atomic.spinLoopHint();
+    }
+
+    // Manager is ready - now load and run target (NO EXECVE!)
+    return loadAndRunTarget(state, command);
+}
+
+/// Entry point for manager thread
+fn managerThreadEntry(arg: usize) callconv(.C) u8 {
+    const ctx: *ManagerThreadContext = @ptrFromInt(arg);
+    managerThreadMain(ctx.state);
+    return 0;
 }
 
 /// Manager thread main function - sets up syscall interception and handles events

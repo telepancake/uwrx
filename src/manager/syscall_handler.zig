@@ -2,23 +2,29 @@
 //!
 //! Processes seccomp notifications and handles syscalls appropriately
 //! based on uwrx's requirements (filesystem overlay, network isolation, etc.)
+//!
+//! IMPORTANT: Manager thread and target thread share the same address space
+//! (via CLONE_VM). This means we can directly access pointers from syscall
+//! arguments without needing process_vm_writev.
 
 const std = @import("std");
 const linux = @import("../util/linux.zig");
 const seccomp = @import("seccomp.zig");
+const prng = @import("../reproducibility/prng.zig");
+const time_mod = @import("../reproducibility/time.zig");
 
 /// Syscall handler context
 pub const HandlerContext = struct {
     allocator: std.mem.Allocator,
     seccomp_fd: linux.fd_t,
-    /// Filesystem overlay state
+    /// Hierarchical PRNG for reproducible random
+    prng_state: ?*prng.HierarchicalPrng = null,
+    /// Deterministic time state
+    time_state: ?*time_mod.DeterministicTime = null,
+    /// Filesystem overlay state (opaque pointer)
     fs_state: ?*anyopaque = null,
-    /// Network state
+    /// Network state (opaque pointer)
     net_state: ?*anyopaque = null,
-    /// PRNG state for reproducible random
-    prng_state: ?*anyopaque = null,
-    /// Time state for deterministic time
-    time_state: ?*anyopaque = null,
 };
 
 /// Handle syscall notifications in a loop
@@ -81,7 +87,9 @@ fn handleSyscall(ctx: *HandlerContext, notif: *const linux.SeccompNotif) linux.S
         linux.SYS.getrandom => handleGetrandom(ctx, notif),
 
         // Time syscalls
-        linux.SYS.clock_gettime, linux.SYS.gettimeofday, linux.SYS.time => handleTime(ctx, notif),
+        linux.SYS.clock_gettime => handleClockGettime(ctx, notif),
+        linux.SYS.gettimeofday => handleGettimeofday(ctx, notif),
+        linux.SYS.time => handleTimeSyscall(ctx, notif),
 
         else => seccomp.continueResponse(notif.id),
     };
@@ -215,21 +223,114 @@ fn handleSockname(_: *HandlerContext, notif: *const linux.SeccompNotif) linux.Se
 // Random syscall handlers
 // ============================================================================
 
-fn handleGetrandom(_: *HandlerContext, notif: *const linux.SeccompNotif) linux.SeccompNotifResp {
-    // Return PRNG-generated random bytes
-    // For now, just continue
-    return seccomp.continueResponse(notif.id);
+/// Handle getrandom syscall - provide reproducible random bytes
+/// getrandom(buf, buflen, flags) -> ssize_t
+///
+/// Since we share address space with target (CLONE_VM), we can write
+/// directly to the buffer pointer.
+fn handleGetrandom(ctx: *HandlerContext, notif: *const linux.SeccompNotif) linux.SeccompNotifResp {
+    const prng_state = ctx.prng_state orelse {
+        // No PRNG state, let syscall proceed normally
+        return seccomp.continueResponse(notif.id);
+    };
+
+    const buf_ptr = notif.data.args[0]; // Buffer pointer (same address space!)
+    const buflen = notif.data.args[1]; // Buffer length
+    // flags = notif.data.args[2] (ignored for reproducibility)
+
+    if (buflen == 0 or buf_ptr == 0) {
+        return seccomp.successResponse(notif.id, 0);
+    }
+
+    // Limit buffer size
+    const max_buflen: usize = 256;
+    const actual_len: usize = @min(@as(usize, @intCast(buflen)), max_buflen);
+
+    // Direct access to target's buffer (same address space via CLONE_VM)
+    const buf: [*]u8 = @ptrFromInt(buf_ptr);
+
+    // Generate reproducible random bytes directly into target's buffer
+    prng_state.fillBytes(notif.pid, buf[0..actual_len]);
+
+    // Return bytes written (don't execute actual syscall)
+    return seccomp.successResponse(notif.id, @intCast(actual_len));
 }
 
 // ============================================================================
 // Time syscall handlers
 // ============================================================================
 
-fn handleTime(_: *HandlerContext, notif: *const linux.SeccompNotif) linux.SeccompNotifResp {
-    // Return deterministic time
-    // For now, just continue
-    return seccomp.continueResponse(notif.id);
+/// Handle clock_gettime syscall - provide deterministic time
+/// clock_gettime(clockid, *timespec) -> int
+fn handleClockGettime(ctx: *HandlerContext, notif: *const linux.SeccompNotif) linux.SeccompNotifResp {
+    const time_state = ctx.time_state orelse {
+        return seccomp.continueResponse(notif.id);
+    };
+
+    const clockid = notif.data.args[0];
+    const ts_ptr = notif.data.args[1];
+
+    // Only intercept CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1)
+    if (clockid != 0 and clockid != 1) {
+        return seccomp.continueResponse(notif.id);
+    }
+
+    if (ts_ptr == 0) {
+        return seccomp.errorResponse(notif.id, std.os.linux.E.FAULT);
+    }
+
+    // Direct access to target's timespec (same address space)
+    const ts: *std.os.linux.timespec = @ptrFromInt(ts_ptr);
+    const result = time_state.getTimespec();
+    ts.* = result;
+
+    return seccomp.successResponse(notif.id, 0);
 }
+
+/// Handle gettimeofday syscall - provide deterministic time
+/// gettimeofday(*timeval, *timezone) -> int
+fn handleGettimeofday(ctx: *HandlerContext, notif: *const linux.SeccompNotif) linux.SeccompNotifResp {
+    const time_state = ctx.time_state orelse {
+        return seccomp.continueResponse(notif.id);
+    };
+
+    const tv_ptr = notif.data.args[0];
+    // timezone (args[1]) is usually NULL and deprecated
+
+    if (tv_ptr == 0) {
+        return seccomp.successResponse(notif.id, 0);
+    }
+
+    // Direct access to target's timeval (same address space)
+    const tv: *std.os.linux.timeval = @ptrFromInt(tv_ptr);
+    tv.* = time_state.getTimeval();
+
+    return seccomp.successResponse(notif.id, 0);
+}
+
+/// Handle time syscall - provide deterministic time
+/// time(*time_t) -> time_t
+fn handleTimeSyscall(ctx: *HandlerContext, notif: *const linux.SeccompNotif) linux.SeccompNotifResp {
+    const time_state = ctx.time_state orelse {
+        return seccomp.continueResponse(notif.id);
+    };
+
+    const t_ptr = notif.data.args[0];
+    const t = time_state.getTime();
+
+    // If pointer is non-null, write to it (same address space)
+    if (t_ptr != 0) {
+        const t_dest: *i64 = @ptrFromInt(t_ptr);
+        t_dest.* = t;
+    }
+
+    // Return time value
+    return seccomp.successResponse(notif.id, t);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 test "handler context initialization" {
     const allocator = std.testing.allocator;
@@ -238,4 +339,115 @@ test "handler context initialization" {
         .seccomp_fd = -1,
     };
     try std.testing.expect(ctx.fs_state == null);
+    try std.testing.expect(ctx.prng_state == null);
+    try std.testing.expect(ctx.time_state == null);
+}
+
+test "getrandom handler with prng - null buffer" {
+    const notif = linux.SeccompNotif{
+        .id = 12345,
+        .pid = 1000,
+        .flags = 0,
+        .data = .{
+            .nr = linux.SYS.getrandom,
+            .arch = linux.auditArch(),
+            .instruction_pointer = 0,
+            .args = .{ 0, 16, 0, 0, 0, 0 }, // buf=NULL, len=16
+        },
+    };
+
+    var prng_state = prng.HierarchicalPrng.init(12345);
+    defer prng_state.deinit();
+
+    var ctx = HandlerContext{
+        .allocator = std.testing.allocator,
+        .seccomp_fd = -1,
+        .prng_state = &prng_state,
+    };
+
+    const resp = handleGetrandom(&ctx, &notif);
+    // Should return 0 for null buffer
+    try std.testing.expectEqual(@as(i64, 0), resp.val);
+}
+
+test "getrandom handler without prng" {
+    const notif = linux.SeccompNotif{
+        .id = 12345,
+        .pid = 1000,
+        .flags = 0,
+        .data = .{
+            .nr = linux.SYS.getrandom,
+            .arch = linux.auditArch(),
+            .instruction_pointer = 0,
+            .args = .{ 0x1000, 16, 0, 0, 0, 0 },
+        },
+    };
+
+    var ctx = HandlerContext{
+        .allocator = std.testing.allocator,
+        .seccomp_fd = -1,
+        .prng_state = null, // No PRNG
+    };
+
+    const resp = handleGetrandom(&ctx, &notif);
+    // Should return CONTINUE flag when no PRNG state
+    try std.testing.expectEqual(linux.SECCOMP_USER_NOTIF_FLAG_CONTINUE, resp.flags);
+}
+
+test "time handler with null pointer" {
+    var time_state = time_mod.DeterministicTime.initWithTime(1700000000);
+
+    const notif = linux.SeccompNotif{
+        .id = 12345,
+        .pid = 1000,
+        .flags = 0,
+        .data = .{
+            .nr = linux.SYS.time,
+            .arch = linux.auditArch(),
+            .instruction_pointer = 0,
+            .args = .{ 0, 0, 0, 0, 0, 0 }, // NULL pointer
+        },
+    };
+
+    var ctx = HandlerContext{
+        .allocator = std.testing.allocator,
+        .seccomp_fd = -1,
+        .time_state = &time_state,
+    };
+
+    const resp = handleTimeSyscall(&ctx, &notif);
+    // Should return deterministic time value
+    try std.testing.expectEqual(@as(i64, 1700000000), resp.val);
+    try std.testing.expectEqual(@as(i32, 0), resp.@"error");
+    try std.testing.expectEqual(@as(u32, 0), resp.flags); // Not CONTINUE
+}
+
+test "prng reproducibility across calls" {
+    var prng_state = prng.HierarchicalPrng.init(12345);
+    defer prng_state.deinit();
+
+    var buf1: [16]u8 = undefined;
+    var buf2: [16]u8 = undefined;
+
+    prng_state.fillBytes(1, &buf1);
+
+    // Reset with same seed
+    var prng_state2 = prng.HierarchicalPrng.init(12345);
+    defer prng_state2.deinit();
+
+    prng_state2.fillBytes(1, &buf2);
+
+    // Should be identical
+    try std.testing.expectEqualSlices(u8, &buf1, &buf2);
+}
+
+test "time state determinism" {
+    var time_state = time_mod.DeterministicTime.initWithTime(1700000000);
+
+    const t1 = time_state.getTime();
+    const t2 = time_state.getTime();
+
+    // Frozen mode: times should be equal
+    try std.testing.expectEqual(t1, t2);
+    try std.testing.expectEqual(@as(i64, 1700000000), t1);
 }

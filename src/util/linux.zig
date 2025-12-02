@@ -537,6 +537,98 @@ pub fn ioctl(fd: fd_t, request: usize, arg: usize) isize {
 }
 
 // ============================================================================
+// Process memory access (for seccomp handlers)
+// ============================================================================
+
+pub const IoVec = extern struct {
+    base: [*]u8,
+    len: usize,
+};
+
+/// Write to another process's memory
+pub fn processVmWritev(pid: linux.pid_t, local_iov: []const IoVec, remote_iov: []const IoVec) isize {
+    const result = linux.syscall6(
+        .process_vm_writev,
+        @intCast(pid),
+        @intFromPtr(local_iov.ptr),
+        local_iov.len,
+        @intFromPtr(remote_iov.ptr),
+        remote_iov.len,
+        0,
+    );
+    return @bitCast(result);
+}
+
+/// Read from another process's memory
+pub fn processVmReadv(pid: linux.pid_t, local_iov: []const IoVec, remote_iov: []const IoVec) isize {
+    const result = linux.syscall6(
+        .process_vm_readv,
+        @intCast(pid),
+        @intFromPtr(local_iov.ptr),
+        local_iov.len,
+        @intFromPtr(remote_iov.ptr),
+        remote_iov.len,
+        0,
+    );
+    return @bitCast(result);
+}
+
+/// Write data to target process memory at specified address
+pub fn writeToProcess(pid: linux.pid_t, remote_addr: u64, data: []const u8) !void {
+    var local_iov = [_]IoVec{.{
+        .base = @constCast(data.ptr),
+        .len = data.len,
+    }};
+    var remote_iov = [_]IoVec{.{
+        .base = @ptrFromInt(remote_addr),
+        .len = data.len,
+    }};
+
+    const result = processVmWritev(pid, &local_iov, &remote_iov);
+    if (result < 0) {
+        return error.ProcessVmWritevFailed;
+    }
+}
+
+/// Read data from target process memory at specified address
+pub fn readFromProcess(pid: linux.pid_t, remote_addr: u64, buffer: []u8) !usize {
+    var local_iov = [_]IoVec{.{
+        .base = buffer.ptr,
+        .len = buffer.len,
+    }};
+    var remote_iov = [_]IoVec{.{
+        .base = @ptrFromInt(remote_addr),
+        .len = buffer.len,
+    }};
+
+    const result = processVmReadv(pid, &local_iov, &remote_iov);
+    if (result < 0) {
+        return error.ProcessVmReadvFailed;
+    }
+    return @intCast(result);
+}
+
+/// Read a null-terminated string from target process memory
+pub fn readStringFromProcess(allocator: std.mem.Allocator, pid: linux.pid_t, remote_addr: u64, max_len: usize) ![]u8 {
+    var buffer = try allocator.alloc(u8, max_len);
+    errdefer allocator.free(buffer);
+
+    const bytes_read = try readFromProcess(pid, remote_addr, buffer);
+
+    // Find null terminator
+    for (buffer[0..bytes_read], 0..) |c, i| {
+        if (c == 0) {
+            const result = try allocator.dupe(u8, buffer[0..i]);
+            allocator.free(buffer);
+            return result;
+        }
+    }
+
+    // No null terminator found, return full buffer
+    return buffer;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

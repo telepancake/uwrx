@@ -82,8 +82,8 @@ const intercepted_syscalls = [_]i32{
 const MAX_BPF_INSNS = 256;
 
 /// Build the seccomp BPF filter
-fn buildFilter() [MAX_BPF_INSNS]linux.SockFilter {
-    var filter: [MAX_BPF_INSNS]linux.SockFilter = undefined;
+fn buildFilter() struct { filter: [MAX_BPF_INSNS]linux.SockFilter, count: usize } {
+    var filter: [MAX_BPF_INSNS]linux.SockFilter = @splat(linux.SockFilter{ .code = 0, .jt = 0, .jf = 0, .k = 0 });
     var idx: usize = 0;
 
     // Load architecture
@@ -134,26 +134,16 @@ fn buildFilter() [MAX_BPF_INSNS]linux.SockFilter {
     filter[idx] = linux.bpfStmt(linux.BPF_RET | linux.BPF_K, linux.SECCOMP_RET_USER_NOTIF);
     idx += 1;
 
-    return filter;
+    return .{ .filter = filter, .count = idx };
 }
 
 /// Set up seccomp filter and return the notification fd
 pub fn setupFilter() !linux.fd_t {
-    const filter = buildFilter();
-
-    // Count actual instructions used
-    var insn_count: u16 = 0;
-    for (filter) |insn| {
-        if (insn.code == 0 and insn.jt == 0 and insn.jf == 0 and insn.k == 0) {
-            // Found end of filter
-            if (insn_count > 0) break;
-        }
-        insn_count += 1;
-    }
+    const result_filter = buildFilter();
 
     const prog = linux.SockFprog{
-        .len = insn_count,
-        .filter = &filter,
+        .len = @intCast(result_filter.count),
+        .filter = &result_filter.filter,
     };
 
     // Set no_new_privs (required for seccomp without CAP_SYS_ADMIN)
@@ -234,16 +224,8 @@ pub fn successResponse(id: u64, val: i64) linux.SeccompNotifResp {
 }
 
 test "filter size" {
-    const filter = buildFilter();
-    var count: usize = 0;
-    for (filter) |insn| {
-        if (insn.code != 0 or insn.jt != 0 or insn.jf != 0 or insn.k != 0) {
-            count += 1;
-        } else if (count > 0) {
-            break;
-        }
-    }
+    const result = buildFilter();
     // Should have reasonable number of instructions
-    try std.testing.expect(count > 0);
-    try std.testing.expect(count < MAX_BPF_INSNS);
+    try std.testing.expect(result.count > 0);
+    try std.testing.expect(result.count < MAX_BPF_INSNS);
 }
