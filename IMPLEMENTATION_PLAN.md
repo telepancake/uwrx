@@ -70,6 +70,13 @@ uwrx/
 │   │   ├── mod.zig              # Inspection module root
 │   │   ├── cli.zig              # CLI inspection commands
 │   │   └── tui.zig              # Interactive terminal UI
+│   ├── bundle/
+│   │   ├── mod.zig              # Bundle module root
+│   │   ├── format.zig           # Bundle section format and parsing
+│   │   ├── lookup.zig           # Bundled executable lookup
+│   │   ├── execute.zig          # Direct execution of bundled code
+│   │   ├── data.zig             # Bundled data overlay access
+│   │   └── create.zig           # Bundle creation tool
 │   ├── tests/
 │   │   ├── unit/                # Unit tests
 │   │   └── integration/         # Integration tests
@@ -124,6 +131,11 @@ uwrx/
         - source: host path (initial), or tar:/git:/oci:/squashfs: prefixed (future)
     - "test <test> [options]" - run a test case
     - "ui <path>" - examine a trace interactively
+    - "bundle [options]" - create bundled uwrx with executables and data
+      - `--output <path>` - output path for bundled uwrx
+      - `--add <name>=<executable>` - add executable to bundle (repeatable)
+      - `--data <squashfs>` - add data overlay (compressed filesystem)
+  - Symlink/hardlink dispatch: if argv[0] matches bundled executable name, run it
   - Initialize logging
   - Dispatch to appropriate module
 
@@ -355,13 +367,14 @@ uwrx/
 
 #### 6.1 Overlay Filesystem (`src/filesystem/overlay.zig`)
 - **Tasks**:
-  - Build layered view from sources, parent traces, and per-process versions
+  - Build layered view from sources, parent traces, per-process versions, and bundled data
   - For process P reading file X, resolution order:
     1. Find all `files-<pid>/X` where `pid < P` (versions written before P ran)
     2. Use the one with largest such pid
     3. If none exist, use `files/X` (the original first version)
     4. If not in `files/` at all, check parent traces' `files/` directories
     5. Check sources (in priority order: lower priority number wins, longer dst wins on tie)
+    6. Check bundled data overlay (if uwrx has bundled executables)
     - Real filesystem is NOT directly accessible (isolation)
   - Note: `files-<pid>/` not `files/<pid>/` to distinguish from normal paths like `/123/foo`
   - Pids are deterministic (allocated by uwrx), not actual OS pids
@@ -534,6 +547,65 @@ uwrx/
 
 ---
 
+### Phase 10: Bundled Executables
+
+#### 10.1 Bundle Format (`src/bundle/format.zig`)
+- **Tasks**:
+  - Define ELF section format for bundled content:
+    - `.uwrx.execs` - bundled executables index and data
+    - `.uwrx.data` - compressed filesystem overlay (squashfs or similar)
+  - Index format for executables:
+    - name -> (offset, size, entry_point_offset) mapping
+  - Parse bundled sections from own executable at startup
+  - Handle case where sections don't exist (plain uwrx without bundles)
+
+#### 10.2 Bundled Executable Lookup (`src/bundle/lookup.zig`)
+- **Tasks**:
+  - On startup, check argv[0] against bundled executable names
+  - If match: dispatch to run that executable under supervision
+  - Provide lookup function: `findBundled(name) -> ?BundledExec`
+  - BundledExec contains: code pointer, size, entry point offset
+
+#### 10.3 Direct Execution (`src/bundle/execute.zig`)
+- **Tasks**:
+  - When manager thread intercepts execve() for bundled executable:
+    - Skip filesystem load entirely
+    - Bundled code already in memory (part of uwrx in high addresses)
+    - Set up execution environment (stack, auxv, etc.)
+    - Transfer directly to bundled executable's entry point
+  - Requirements for bundled executables:
+    - Must be statically linked
+    - Must be position-independent (relocatable)
+    - Entry point must be relative to load address
+  - Significant performance win: no I/O, no memory allocation for code
+
+#### 10.4 Bundled Data Overlay (`src/bundle/data.zig`)
+- **Tasks**:
+  - Parse `.uwrx.data` section as compressed filesystem
+  - Provide file lookup interface for overlay resolution
+  - Integrate with overlay filesystem as lowest-priority layer
+  - Contains files bundled programs need:
+    - /usr/include/* (headers)
+    - /usr/lib/gcc/* (compiler support)
+    - /usr/lib/*.a (static libraries)
+    - etc.
+
+#### 10.5 Bundle Creation Tool (`src/bundle/create.zig`)
+- **Tasks**:
+  - `uwrx bundle` command implementation:
+    - `--output <path>` - output path for new bundled uwrx
+    - `--add <name>=<executable>` - add executable (repeatable)
+    - `--data <squashfs>` - add data overlay
+  - Process:
+    - Copy own executable as base
+    - Validate executables are static and relocatable
+    - Append executables to `.uwrx.execs` section
+    - Append data overlay to `.uwrx.data` section
+    - Update ELF section headers
+  - Produce self-contained uwrx with complete toolchain
+
+---
+
 ## Implementation Order
 
 ### Milestone 1: Basic Supervision (MVP)
@@ -597,6 +669,14 @@ uwrx/
 4. Documentation
 5. Comprehensive testing
 
+### Milestone 9: Bundled Executables
+1. Bundle format and section parsing
+2. Bundled executable lookup
+3. Direct execution of bundled code
+4. Bundled data overlay integration
+5. Bundle creation tool
+6. Symlink/hardlink invocation dispatch
+
 ---
 
 ## Key Technical Challenges
@@ -625,6 +705,13 @@ uwrx/
 - Multiple processes writing to tmpfs simultaneously
 - Supervisor reading while processes write
 - Use atomic operations and careful offset management
+
+### 6. Bundled Executable Requirements
+- Bundled executables must be statically linked and position-independent
+- May require recompiling toolchain with specific flags (-static -fPIC)
+- Entry point detection and relocation handling
+- ELF section manipulation for bundle creation
+- Compressed data overlay access without extraction to disk
 
 ---
 

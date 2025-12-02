@@ -49,6 +49,7 @@ File resolution order during process execution:
   2. files/<path> (current run first writes)
   3. parent traces' files/ directories
   4. sources (in priority order)
+  5. bundled data overlay (if uwrx has bundled executables)
   - real filesystem is NOT directly accessible (isolation)
 
 Source specifications are saved in the attempt's "sources" file for reproducibility.
@@ -125,7 +126,8 @@ attempt directory has following files:
       2. use the one with largest such pid
       3. if none exist, use files/<path> (the original first version)
       4. if not in files/ at all, check parent traces' files/ directories
-      5. finally, check sources (in priority order)
+      5. check sources (in priority order)
+      6. check bundled data overlay (if uwrx has bundled executables)
       - real filesystem is NOT directly accessible (isolation)
 
     no need to record pid for files in base files/ - pid ordering determines visibility:
@@ -217,3 +219,59 @@ this allows seeing lists of files that were read/modified, lists and trees of pr
 summary stdout/stderr as well as per process output and so on.
 There is also an interactive terminal UI that presents hierarchy of all launched processes, and allows
 navigating and examinig each process and it's related entries.
+
+BUNDLED EXECUTABLES
+
+uwrx can be built as a multi-executable bundle, similar to busybox but using uwrx's own mechanisms.
+this allows uwrx to be distributed as a single binary containing a complete toolchain.
+
+Bundle structure:
+  uwrx binary contains:
+    - uwrx supervisor and manager code
+    - bundled executables section: statically linked, relocatable binaries (e.g., gcc, ld, as, ar)
+    - bundled data section: compressed filesystem overlay with files normally installed with those programs
+      (headers, libraries, specs files, etc.)
+
+Bundled executables must be:
+  - statically linked (no external dependencies)
+  - position-independent / relocatable (can run from any address)
+  - self-contained (all needed data files bundled in data section)
+
+Execution of bundled programs:
+  when manager thread intercepts execve() for a bundled executable:
+    - instead of loading from filesystem, locate the executable in uwrx's bundled section
+    - the executable is already loaded in high memory as part of uwrx
+    - transfer directly to the bundled executable's entry point
+    - no need to read from filesystem or allocate new memory for code
+
+File access for bundled programs:
+  when a bundled program reads files (e.g., gcc reading headers):
+    - the bundled data section provides an implicit source layer
+    - this layer has lowest priority (checked after all other sources)
+    - contains files that would normally be installed with the program:
+      /usr/include/*, /usr/lib/gcc/*, etc.
+
+Bundle creation:
+  uwrx provides a command to create bundles:
+    uwrx bundle --output <path> --add <name>=<executable> --data <overlay.squashfs>
+
+  the bundle command:
+    - takes uwrx as base
+    - adds specified executables to the bundled executables section
+    - adds data overlay to the bundled data section
+    - produces a new uwrx binary with everything included
+
+Symlink/hardlink invocation (like busybox):
+  if uwrx is invoked via a symlink or hardlink named after a bundled executable:
+    uwrx automatically runs that executable under supervision
+  example:
+    ln -s uwrx gcc
+    ./gcc -c foo.c    # equivalent to: uwrx run -- gcc -c foo.c
+
+File resolution with bundles (updated order):
+  1. files-<pid>/<path> (current run overwrites, pid < current)
+  2. files/<path> (current run first writes)
+  3. parent traces' files/ directories
+  4. sources (in priority order)
+  5. bundled data overlay (implicit, lowest priority)
+  - real filesystem is NOT directly accessible (isolation)
